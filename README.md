@@ -18,9 +18,9 @@ bash install.sh
 
 按交互菜单完成配置：
 
-1. 准备已有 Grok Bot 的 webhook URL/key，参考 [Bot 提示词](docs/grok-bot-prompt.md)。
+1. 准备已有 Grok Bot；首次填写凭证时，脚本会显示可复制的 webhook 配置模板。
 2. 同机同用户选择**本机部署（无需 SSH）**，一次配置运行端和回传端；跨机则分别配置这两端。
-3. 按提示输入 URL/key，将生成的提示词交给 Bot。
+3. 按提示输入 URL/key；配置完成后，复制终端显示的完整提示词交给 Bot，助手路径和路由已自动填好。
 4. 在 Multica 新聊天发送“请只回复 `GBB_RUNTIME_OK`”，确认回答正常返回。
 
 运行端支持 Linux / macOS，需要 Python 3.9+、Node.js 20+ / npm，以及已登录且 daemon 运行中的 Multica CLI；请在 daemon 用户的普通终端安装。Multica profile、工作区可使用当前配置。

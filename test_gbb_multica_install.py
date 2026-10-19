@@ -1,6 +1,8 @@
 """Real offline npm install + fake Multica and SSH. Never call production Bots/APIs."""
 import argparse
+from contextlib import redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -109,7 +111,9 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         environment = dict(self.env, HOME=str(self.mac_home), FAKE_SSH_MAP=str(self.ssh_map), FAKE_SSH_LOG=str(self.ssh_log))
         args = argparse.Namespace(route='alice', instance_id='alice', ssh_alias='server-alice', endpoint=None,
                                   bot='bridge-alice', check=False)
-        with patch.dict(os.environ, environment, clear=True), patch.object(INSTALL['platform'], 'system', return_value='Darwin'):
+        output = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), patch.object(INSTALL['platform'], 'system', return_value='Darwin'), \
+                redirect_stdout(output):
             INSTALL['mac'](args, config_root, bin_dir)
             args.route = args.instance_id = 'bob'
             args.ssh_alias, args.endpoint, args.bot = 'server-bob', self.server['wrapper'].replace('gbb-multica-agent', 'gbb-multica-endpoint'), 'bridge-bob'
@@ -120,6 +124,10 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         self.assertNotIn('{{', prompt)
         self.assertIn('server-alice', prompt)
         self.assertIn('server-bob', prompt)
+        self.assertIn('========== Grok Bot 提示词开始 ==========\n' + prompt.rstrip() +
+                      '\n========== Grok Bot 提示词结束 ==========', output.getvalue())
+        self.assertIn(shlex.quote(str(bin_dir / 'gbb-multica-remote')) + ' answer', prompt)
+        self.assertNotIn('OFFLINE_SECRET_NEVER_PRINT', output.getvalue())
         reply = '中文\n{"final":"保留 $HOME、`字面量`、引号"}\n第二行'
         for name, home in (('alice', Path(self.server['gbb_home'])), ('bob', self.bob_gbb)):
             messages = home / 'messages'
@@ -243,6 +251,11 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
             result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('LOCAL_OFFLINE_ONLY', result.stdout + result.stderr)
+            prompt = (config_root / 'grok-bot-prompt.md').read_text()
+            self.assertIn('========== Grok Bot 提示词开始 ==========\n' + prompt.rstrip() +
+                          '\n========== Grok Bot 提示词结束 ==========', result.stdout)
+            self.assertIn(shlex.quote(str(home / '.local/bin/gbb-multica-remote')) + ' answer', prompt)
+            self.assertNotIn('/实际路径/', prompt)
         saved = json.loads((config_root / 'server.json').read_text())
         route = json.loads((config_root / 'routes.json').read_text())['routes']['desktop-reply']
         self.assertEqual((route['transport'], route['instance_id'], route['bot']), ('local', 'desktop', 'bridge-desktop'))
@@ -255,6 +268,7 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         snapshot = {p.name: p.read_bytes() for p in config_root.iterdir() if p.is_file()}
         checked = subprocess.run(command + ['--check'], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertNotIn('Grok Bot 提示词开始', checked.stdout)
         # The macOS branch uses the same portable ps command; real Mac validation is separate.
         with patch.dict(os.environ, env, clear=True), patch.object(INSTALL['platform'], 'system', return_value='Darwin'), \
                 patch.object(INSTALL['sys'], 'argv', ['install.py', *command[2:], '--check']):
@@ -402,10 +416,20 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
     def test_new_credentials_use_private_store_without_sending(self):
         home = self.root / 'fresh-gbb'
         home.mkdir(exist_ok=True, mode=0o700)
+        output = io.StringIO()
+        template = (ROOT / 'docs/grok-bot-prompt.md').read_text()
+        def input_url(_):
+            # The full copyable template must be visible before asking for credentials.
+            self.assertIn(template.rstrip(), output.getvalue())
+            self.assertIn('Grok Bot 提示词结束', output.getvalue())
+            return 'https://example.invalid/webhook'
         with patch.object(INSTALL['sys'].stdin, 'isatty', return_value=True), \
-                patch('builtins.input', return_value='https://example.invalid/webhook'), \
-                patch.object(INSTALL['getpass'], 'getpass', return_value='FRESH_OFFLINE_KEY'):
+                patch('builtins.input', side_effect=input_url), \
+                patch.object(INSTALL['getpass'], 'getpass', return_value='FRESH_OFFLINE_KEY'), \
+                redirect_stdout(output):
             INSTALL['configure_credentials'](shutil.which('node'), Path(self.server['gbb_bin']), home, 'bridge-fresh')
+        self.assertNotIn('FRESH_OFFLINE_KEY', output.getvalue())
+        self.assertNotIn('https://example.invalid/webhook', output.getvalue())
         credential = json.loads((home / 'credentials.json').read_text())['bridge-fresh']
         self.assertEqual(credential['key'], 'FRESH_OFFLINE_KEY')
         self.assertEqual((home / 'credentials.json').stat().st_mode & 0o777, 0o600)

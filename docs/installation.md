@@ -48,7 +48,7 @@ bash install.sh local --check
 
 `local` 接受运行端参数，包括 `--profile`、`--workspace-id`、`--agent-name`、`--gbb-home` 和 `--reply-route`。两端自动共享这些设置；重复执行复用已有资源。自定义数据目录、路由名也不需要再配置一次回传端。
 
-把生成的 `~/.config/gbb-multica/grok-bot-prompt.md` 交给本机 Grok Bot，并允许其工具执行能力调用提示词中的回填助手。本机部署仍通过 webhook 向 Bot 发送任务，通过本机 endpoint 回填；请保留 webhook URL/key 配置。最后在 Multica 新聊天验证 `GBB_RUNTIME_OK`。
+配置完成后，终端直接显示“Grok Bot 提示词开始 / 结束”复制区。把两条分隔线之间的完整内容粘贴到本机 Grok Bot，助手路径、命令示例和路由已自动填好；允许其工具执行能力调用提示词中的回填助手。相同内容保存在 `~/.config/gbb-multica/grok-bot-prompt.md`（设置了 `GBB_MULTICA_CONFIG_HOME` 时保存在该目录），重跑安装也会再次显示。本机部署仍通过 webhook 向 Bot 发送任务，通过本机 endpoint 回填；请保留 webhook URL/key 配置。最后在 Multica 新聊天验证 `GBB_RUNTIME_OK`。
 
 运行端已经配置好时，`reply --route 原路由名` 会识别匹配的本机实例，自动采用本机直连；原有 SSH 路由保持其已保存的连接方式，显式 `--transport` 可以指定方式。
 
@@ -56,7 +56,7 @@ bash install.sh local --check
 
 ### 1. 准备已有 Bot 的 webhook
 
-把 [Bot 提示词模板](grok-bot-prompt.md) 交给已有 Grok Bot，创建或更新 webhook routine，从面板取得 URL/key。已有 Bot 和 routine 可复用；不必再创建。名称可用 `bridge-host-alice` 方便识别。两端安装后，再把回传端生成的实际提示词交给 Bot，替换模板占位符。
+运行端首次需要 URL/key 时，会先在终端完整显示 [Bot 提示词模板](grok-bot-prompt.md)。直接复制标记之间的内容交给已有 Grok Bot，创建或更新 webhook routine，从面板取得 URL/key，再回终端填写。已有 Bot 和 routine 可复用；不必再创建。名称可用 `bridge-host-alice` 方便识别。两端安装后，脚本会再次显示自动填好路径和路由的完整提示词，复制它更新 Bot 的处理说明即可。
 
 ### 2. 配置运行端
 
@@ -96,7 +96,7 @@ bash install.sh reply --route host-alice --transport local --bot bridge-host-ali
 bash install.sh reply --route host-alice --ssh-alias multica-alice --bot bridge-host-alice
 ```
 
-脚本发现 endpoint 的绝对路径，验证目标实例、gbb 0.2.0 和配置可读状态，然后合并保存路由，安装 `~/.local/bin/gbb-multica-remote`，生成 `~/.config/gbb-multica/grok-bot-prompt.md`。把该提示词交给对应 Bot，并让它的工具执行环境能够运行这个助手。
+脚本发现 endpoint 的绝对路径，验证目标实例、gbb 0.2.0 和配置可读状态，然后合并保存路由，安装 `~/.local/bin/gbb-multica-remote`，生成 `~/.config/gbb-multica/grok-bot-prompt.md`，并在终端完整显示可复制的提示词。把两条提示词分隔线之间的内容交给对应 Bot，无需打开文件或手工替换助手路径、路由；让它的工具执行环境能够运行这个助手。`--check` 只检查链路，不生成或显示提示词。
 
 默认 `route` 与运行端实例名相同。运行端使用不同的 `--reply-route` 时，回传端须同时设置 `--route 回填路由名 --instance-id 实际实例名`。
 

@@ -11,7 +11,7 @@ Routine 名称：`Multica bridge`。触发方式：`webhook / When a webhook fir
 3. 答案必须通过可访问回传端的电脑/工具执行能力调用回填助手。安装后真实程序路径为 `{{REMOTE_HELPER}}`。命令形式为：
 
    ```bash
-   /实际路径/gbb-multica-remote answer 本轮reply_route 本轮message_id - <<'GBB_REPLY'
+   {{REMOTE_HELPER_COMMAND}} answer 本轮reply_route 本轮message_id - <<'GBB_REPLY'
    本轮完整回答，或本轮要求的 JSON
    GBB_REPLY
    ```
@@ -23,10 +23,10 @@ Routine 名称：`Multica bridge`。触发方式：`webhook / When a webhook fir
 7. 只有用户明确授权的资源操作才能执行。每轮结果以本机工具返回为准；超时的写操作先回读，不要盲目重试。不要从本 routine 额外调用其他 Bot、创建另一套 agent job 或循环任务。
 8. 不在聊天中贴出 webhook URL/key、SSH 私钥或 Multica token。Webhook URL/key 由用户从 routine 面板复制到运行端安装终端。
 
-已配置路由如下（回传端安装向导会填入）：
+可用回填路由：
 
 {{ROUTE_CATALOG}}
 
-首次配置可以先粘贴这个模板并创建/复用 webhook；运行端和回传端配置完成后，再用回传端生成的实际提示词替换模板占位符。允许 Bot 的工具执行能力访问该回传端，并运行指定助手；若使用 SSH 路由，也须具备对应的连接能力。
+允许 Bot 的工具执行能力访问该回传端，并运行指定助手；若使用 SSH 路由，也须具备对应的连接能力。
 
 完成配置后，使用回传端助手的 `check 路由名` 验证电脑执行能力。不要额外调用其他 Bot 或发送测试业务请求；完整问答由用户在 Multica 新聊天发起。

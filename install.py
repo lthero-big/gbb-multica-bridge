@@ -86,6 +86,13 @@ def install_executable(name, bin_dir):
     return destination
 
 
+def show_prompt(content, title):
+    print(f'\n{title}：请复制下方两条分隔线之间的全部内容，粘贴到对应 Grok Bot。')
+    print('========== Grok Bot 提示词开始 ==========')
+    print(content.rstrip())
+    print('========== Grok Bot 提示词结束 ==========\n', flush=True)
+
+
 def configure_credentials(node, gbb, home, bot):
     config = read_config(home / 'config.json')
     credentials = read_config(home / 'credentials.json')
@@ -96,7 +103,8 @@ def configure_credentials(node, gbb, home, bot):
         print(f'复用已有 {bot} webhook 凭证（未发送请求）。')
         return
     require(sys.stdin.isatty(), '缺少 webhook 配置。请在交互终端重跑并输入 URL/key。')
-    print('请先把 docs/grok-bot-prompt.md 交给已有 Bot，取得 webhook URL/key；已有 routine 可直接复用。')
+    show_prompt((ROOT / 'docs/grok-bot-prompt.md').read_text(), f'为 {bot} 配置 webhook 的初始模板')
+    print('已有 routine 可复用原 URL/key；模板中的助手路径和路由将在回传端配置后自动填好并显示，请再复制更新到 Bot。')
     url = input('Webhook URL: ').strip()
     parsed = urlsplit(url)
     require(parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password,
@@ -202,7 +210,10 @@ def prompt_for_routes(routes, helper):
     for name, item in sorted(routes.items()):
         connection = '本机同用户' if item.get('transport') == 'local' else f'SSH `{item["ssh_alias"]}`'
         catalog.append(f'- route `{name}` → {connection}，实例 `{item["instance_id"]}`，Bot `{item.get("bot", "bridge")}`')
-    return (ROOT / 'docs/grok-bot-prompt.md').read_text().replace('{{REMOTE_HELPER}}', str(helper)).replace('{{ROUTE_CATALOG}}', '\n'.join(catalog))
+    return ((ROOT / 'docs/grok-bot-prompt.md').read_text()
+            .replace('{{REMOTE_HELPER}}', str(helper))
+            .replace('{{REMOTE_HELPER_COMMAND}}', shlex.quote(str(helper)))
+            .replace('{{ROUTE_CATALOG}}', '\n'.join(catalog)))
 
 
 def ssh_connection(args, config_root, alias, previous=None):
@@ -298,10 +309,14 @@ def reply(args, config_root, bin_dir):
     routes[route_name] = item
     write_file(config_root / 'routes.json', json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     prompt = config_root / 'grok-bot-prompt.md'
-    write_file(prompt, prompt_for_routes(routes, helper))
+    content = prompt_for_routes(routes, helper)
+    write_file(prompt, content)
     print(f'回传端配置完成。路由：{route_name} → {target}；未发送 Grok 请求。')
-    print(f'提示词：{prompt}；将内容交给已有 Grok Bot，并允许其工具执行环境调用本机助手。')
+    print(f'完整提示词已保存：{prompt}')
     print('检查命令：' + shlex.join([str(helper), 'check', route_name]))
+    show_prompt(content, '已填好助手路径和路由的完整提示词')
+    print('请用以上完整内容更新已有 Bot 的处理说明，并允许其工具执行环境调用助手。')
+    print('然后在 Multica 新聊天发送：请只回复 GBB_RUNTIME_OK。')
     return 0
 
 
