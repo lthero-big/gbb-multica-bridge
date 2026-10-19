@@ -254,7 +254,6 @@ gbb 0.2.0 归档来自本机已安装、通过联调的程序执行 `npm pack --
 在 Linux、Node.js 20+、Python 3.9+ 环境执行：
 
 ```bash
-python3 test_gbb_multica_compat.py
 python3 test_gbb_multica_agent.py
 python3 test_gbb_multica_setup.py
 python3 test_gbb_multica_install.py
