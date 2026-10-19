@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime, reply and independent SSH setup; CLI and interactive wizard."""
+"""Local deployment, runtime, reply and SSH setup; CLI and interactive wizard."""
 import argparse
 import getpass
 import hashlib
@@ -124,7 +124,7 @@ const {pathToFileURL} = require('node:url');
 
 
 def runtime(args, config_root, bin_dir):
-    require(platform.system() == 'Linux', '运行端当前支持 Linux；回传端支持 Linux/macOS')
+    require(platform.system() in ('Linux', 'Darwin'), '运行端支持 Linux/macOS')
     task = (os.environ.get('MULTICA_TOKEN', '').startswith('mat_') or
             any(os.environ.get(k) for k in ('MULTICA_TASK_ID', 'MULTICA_AGENT_ID', 'MULTICA_TASK_CONFIG_ROOT')))
     require(not task or args.check, '请在 daemon 用户已登录 Multica 的普通终端执行，不能借用聊天任务凭证安装')
@@ -152,7 +152,10 @@ def runtime(args, config_root, bin_dir):
     daemon = json.loads(run([*base, 'daemon', 'status', '--output', 'json'],
                             text=True, capture_output=True).stdout)
     require(daemon.get('status') == 'running', '本机 Multica daemon 尚未运行')
-    require(Path('/proc', str(int(daemon['pid']))).stat().st_uid == os.geteuid(),
+    pid = int(daemon['pid'])
+    require(pid > 0, 'daemon PID 无效，无法核实进程归属')
+    daemon_uid = int(run(['ps', '-o', 'uid=', '-p', str(pid)], text=True, capture_output=True).stdout.strip())
+    require(daemon_uid == os.geteuid(),
             '当前用户不是 daemon 的系统用户；停止安装，请换到正确账号')
     current = json.loads(run([*base, 'workspace', 'get', '--output', 'json'],
                              text=True, capture_output=True).stdout)
@@ -189,7 +192,8 @@ def runtime(args, config_root, bin_dir):
     run([endpoint, '--instance-id', instance, 'check'])
     print(f'运行端安装完成。回填路由：{route}；实例：{instance}')
     print(f'Endpoint：{endpoint}')
-    print('接下来配置回传端（可在同机）；安装过程没有向 Grok 发送消息。')
+    if args.mode != 'local':
+        print('接下来配置回传端（可在同机）；安装过程没有向 Grok 发送消息。')
     return 0
 
 
@@ -241,13 +245,19 @@ def reply(args, config_root, bin_dir):
     config = read_config(config_root / 'routes.json')
     routes = config.setdefault('routes', {})
     previous = routes.get(route_name, {})
-    transport = getattr(args, 'transport', None) or previous.get('transport', 'ssh')
-    require(transport in ('local', 'ssh'), '回传方式必须为 local 或 ssh')
+    local_config = read_config(config_root / 'server.json')
+    local_match = route_name == local_config.get('reply_route')
+    instance = safe_name(args.instance_id or previous.get('instance_id') or
+                         (local_config.get('instance_id') if local_match else None) or route_name)
+    local_match = local_match and instance == local_config.get('instance_id')
     bootstrap = getattr(args, 'setup_ssh', False)
+    previous_transport = previous.get('transport', 'ssh') if previous else None
+    transport = (getattr(args, 'transport', None) or ('ssh' if args.ssh_alias or bootstrap else None) or
+                 previous_transport or ('local' if local_match else 'ssh'))
+    require(transport in ('local', 'ssh'), '回传方式必须为 local 或 ssh')
     require(not (bootstrap and args.check), '--setup-ssh 会修改密钥/公钥配置，不能与只读 --check 同用')
-    instance = safe_name(args.instance_id or previous.get('instance_id') or route_name)
     item = dict(transport=transport, instance_id=instance,
-                bot=args.bot or previous.get('bot') or 'bridge-' + instance)
+                bot=args.bot or previous.get('bot') or (local_config.get('bot') if local_match else None) or 'bridge-' + instance)
     if transport == 'ssh':
         require(shutil.which('ssh'), '需要 OpenSSH 客户端')
         connections = read_config(config_root / 'ssh.json').get('connections', {})
@@ -295,6 +305,35 @@ def reply(args, config_root, bin_dir):
     return 0
 
 
+def local(args, config_root, bin_dir):
+    """Install both roles for this user, then bind the reply route without SSH."""
+    result = runtime(args, config_root, bin_dir)
+    if result:
+        return result
+    saved = read_config(config_root / 'server.json')
+    require(saved, '本机运行端配置尚未保存；先完成本机部署，再执行 --check')
+    endpoint = str(Path(saved['wrapper']).with_name('gbb-multica-endpoint'))
+    if args.check:
+        route = read_config(config_root / 'routes.json').get('routes', {}).get(saved['reply_route'], {})
+        require(route.get('transport') == 'local' and route.get('instance_id') == saved['instance_id'] and
+                route.get('endpoint') == endpoint, '本机回填路由缺失或不匹配；请重跑 local 安装')
+        helper = bin_dir / 'gbb-multica-remote'
+        require(helper.is_file() and os.access(helper, os.X_OK), '本机回填助手尚未安装；请重跑 local 安装')
+        run([helper, 'check', saved['reply_route']])
+        print('本机部署检查通过。')
+        return 0
+    reply_args = argparse.Namespace(**vars(args))
+    reply_args.route = saved['reply_route']
+    reply_args.instance_id = saved['instance_id']
+    reply_args.bot = saved['bot']
+    reply_args.transport = 'local'
+    reply_args.endpoint = endpoint
+    result = reply(reply_args, config_root, bin_dir)
+    if not result:
+        print('本机部署完成：运行端和回传端已配置，无需 SSH。')
+    return result
+
+
 # Keep imported functions and old CLI commands compatible with earlier installers.
 server = runtime
 mac = reply
@@ -331,16 +370,17 @@ def wizard_ssh(args, config_root, previous=None):
 
 
 def wizard(args, config_root):
-    require(sys.stdin.isatty(), '交互向导需要终端；自动化执行请指定 runtime / reply / ssh 及参数')
+    require(sys.stdin.isatty(), '交互向导需要终端；自动化执行请指定 local / runtime / reply / ssh 及参数')
     if not args.mode:
         selected = choose('GBB × Multica 配置向导（按职责选择，可在同一台机器上分别执行）',
-                          ['运行端：安装 gbb，注册 Multica runtime / Agent',
+                          ['本机部署：Grok Bot 与 Multica 在本机同用户运行，无需 SSH',
+                           '运行端：安装 gbb，注册 Multica runtime / Agent',
                            '回传端：配置本机或 SSH 回填路由，生成 Bot 提示词',
                            'SSH：单独配置免密登录，无需安装运行端/回传端', '退出'])
-        if selected == 4:
+        if selected == 5:
             return False
-        args.mode = ('runtime', 'reply', 'ssh')[selected - 1]
-    if args.mode == 'runtime':
+        args.mode = ('local', 'runtime', 'reply', 'ssh')[selected - 1]
+    if args.mode in ('local', 'runtime'):
         previous = read_config(config_root / 'server.json')
         default_instance = re.sub(r'[^A-Za-z0-9._-]', '-', socket.gethostname().split('.')[0] + '-' + getpass.getuser())[:80]
         args.instance_id = safe_name(ask(args.instance_id, '运行端实例名（稳定标识）', previous.get('instance_id') or default_instance))
@@ -355,6 +395,8 @@ def wizard(args, config_root):
         args.gbb_home = ask(args.gbb_home, 'gbb 数据目录', previous.get('gbb_home') or str(Path.home() / '.grok-bot-bridge'))
         print(f'\n将为当前系统用户配置运行端：实例={args.instance_id}，Bot={args.bot}，Agent={args.agent_name}')
         print(f'Multica profile={args.profile or "当前配置"}，工作区={args.workspace_id or "当前工作区"}，回填路由={args.reply_route}')
+        if args.mode == 'local':
+            print('本次同时配置本机回传助手、路由和 Bot 提示词；不需要 SSH 或 SSH key。')
     elif args.mode == 'reply':
         routes = read_config(config_root / 'routes.json').get('routes', {})
         local = read_config(config_root / 'server.json')
@@ -412,10 +454,11 @@ def wizard(args, config_root):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog='bash install.sh', description='按职责配置运行端、回传端或独立 SSH；不带参数进入交互菜单。',
+        prog='bash install.sh', description='配置本机一体部署、运行端、回传端或独立 SSH；不带参数进入交互菜单。',
         allow_abbrev=False, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''示例（在仓库目录执行）：
   bash install.sh                         # 交互菜单
+  bash install.sh local                   # 本机部署向导，无需 SSH
   bash install.sh runtime --interactive   # 运行端向导
   bash install.sh reply --interactive     # 回传端向导，可选择本机直连
   bash install.sh ssh                     # 独立 SSH 向导
@@ -424,19 +467,19 @@ def build_parser():
   bash install.sh reply --route host-alice --ssh-alias multica-alice --bot bridge
   bash install.sh ssh --ssh-alias multica-alice --ssh-host example.com --ssh-user alice
 
-runtime 当前支持 Linux；reply / ssh 支持 Linux、macOS。两种职责可以在同一机器。
+local / runtime / reply / ssh 支持 Linux、macOS。本机同用户部署选 local，无需 SSH。
 旧 server / mac 命令分别是 runtime / reply 的兼容别名。
 --profile 选择已有 Multica 登录配置；省略使用当前配置，无需新建 profile。
 更多参数与同机/跨机示例见 README.md。''')
-    parser.add_argument('mode', nargs='?', choices=('runtime', 'reply', 'ssh', 'server', 'mac'),
-                        help='runtime=运行端；reply=回传端；ssh=独立免密登录配置；省略进入菜单')
+    parser.add_argument('mode', nargs='?', choices=('local', 'runtime', 'reply', 'ssh', 'server', 'mac'),
+                        help='local=本机一体部署；runtime=运行端；reply=回传端；ssh=独立免密配置；省略进入菜单')
     common = parser.add_argument_group('通用')
     common.add_argument('--interactive', '-i', action='store_true', help='逐项询问配置并确认；可以预填其他参数')
     common.add_argument('--instance-id', metavar='INSTANCE', help='运行端稳定标识；默认主机名-用户名；回传端默认 route')
     common.add_argument('--bot', metavar='BOT', help='运行端的 gbb Bot alias / 回传端提示词标注；默认 bridge-实例名')
     common.add_argument('--check', action='store_true', help='只读检查；不发送 Grok 请求；SSH 模式仅验证免密登录')
     common.add_argument('--dry-run', action='store_true', help='仅展示步骤；不连接、不写文件')
-    runtime_options = parser.add_argument_group('运行端 runtime')
+    runtime_options = parser.add_argument_group('本机部署 local / 运行端 runtime')
     runtime_options.add_argument('--profile', help='已有 Multica 登录配置；默认当前配置，不创建 profile')
     runtime_options.add_argument('--workspace-id', metavar='UUID', help='目标工作区 UUID；默认当前工作区')
     runtime_options.add_argument('--reply-route', metavar='ROUTE', help='回填路由名；默认 instance-id，须与回传端 route 一致')
@@ -444,7 +487,7 @@ runtime 当前支持 Linux；reply / ssh 支持 Linux、macOS。两种职责可�
     runtime_options.add_argument('--gbb-home', metavar='DIR', help='运行端当前用户的 gbb 数据目录；默认 ~/.grok-bot-bridge')
     reply_options = parser.add_argument_group('回传端 reply')
     reply_options.add_argument('--route', metavar='ROUTE', help='回填路由名，须与运行端 reply-route 一致')
-    reply_options.add_argument('--transport', choices=('local', 'ssh'), help='local=同机同用户直连；ssh=跨主机/用户，首次默认 ssh')
+    reply_options.add_argument('--transport', choices=('local', 'ssh'), help='local=同机同用户直连；ssh=跨主机/用户；新路由匹配本机部署时自动选 local，否则 ssh')
     reply_options.add_argument('--endpoint', metavar='PATH', help='运行端 endpoint 绝对路径；默认发现 ~/.local/bin/gbb-multica-endpoint')
     ssh_options = parser.add_argument_group('独立 ssh / 回传端 SSH')
     ssh_options.add_argument('--ssh-alias', metavar='HOST', help='已有或新建的 SSH 连接别名；独立配置可被回传端复用')
@@ -461,10 +504,12 @@ def validate_args(parser, args):
     if args.mode == 'reply' and any(value is not None for value in
             (args.profile, args.workspace_id, args.reply_route, args.agent_name, args.gbb_home)):
         parser.error('Multica profile/工作区等运行端参数请用于 runtime 模式')
-    if args.mode == 'runtime' and any(value is not None for value in (args.route, args.endpoint)):
-        parser.error('--route/endpoint 用于回传端 reply；运行端的路由参数是 --reply-route')
+    if args.mode in ('local', 'runtime') and any(value is not None for value in (args.route, args.endpoint)):
+        parser.error('--route/endpoint 用于回传端 reply；本机部署/运行端的路由参数是 --reply-route')
     if args.mode == 'runtime' and (args.setup_ssh or connection_options or args.ssh_alias or args.transport):
         parser.error('运行端不使用 SSH/transport 参数；请单独使用 ssh 或 reply')
+    if args.mode == 'local' and (args.setup_ssh or connection_options or args.ssh_alias or args.transport == 'ssh'):
+        parser.error('本机部署不使用 SSH 参数；跨机器/用户请分别使用 runtime / reply')
     if args.mode == 'reply' and connection_options and not args.setup_ssh:
         parser.error('--ssh-host/user/port/key 需与 --setup-ssh 一起使用，或单独使用 ssh 模式')
     if args.mode == 'reply' and args.transport == 'local' and (args.setup_ssh or connection_options or args.ssh_alias):
@@ -491,12 +536,13 @@ def main():
             return 0
         validate_args(parser, args)
     if args.dry_run:
-        print({'runtime': '运行端：校验 gbb 0.2.0 → 用户目录安装 → 配置已有 Bot → 检查 daemon → 注册 runtime/Agent → 安装 endpoint',
+        print({'local': '本机部署：安装运行端 → 注册 runtime/Agent → 本机 endpoint → 本机回传路由 → Bot 提示词；无需 SSH',
+               'runtime': '运行端：校验 gbb 0.2.0 → 用户目录安装 → 配置已有 Bot → 检查 daemon → 注册 runtime/Agent → 安装 endpoint',
                'reply': '回传端：选择本机/SSH → 核对运行端实例 → 安装回填助手 → 合并路由 → 生成 Bot 提示词',
                'ssh': 'SSH：生成/复用密钥 → 必要时一次密码登录追加公钥 → 验证免密 → 保存独立连接'}[args.mode])
         return 0
     os.umask(0o077)
-    return {'runtime': runtime, 'reply': reply, 'ssh': ssh}[args.mode](args, config_root, Path.home() / '.local/bin')
+    return {'local': local, 'runtime': runtime, 'reply': reply, 'ssh': ssh}[args.mode](args, config_root, Path.home() / '.local/bin')
 
 
 if __name__ == '__main__':

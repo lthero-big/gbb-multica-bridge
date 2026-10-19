@@ -166,6 +166,20 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             reset(profiles=[profile.copy()],agents=[agent.copy()],runs=[{"status":"running"}])
             assert run().returncode==1 and state()["writes"]==[]
 
+            reset(daemon_pid=0)
+            assert run().returncode==1 and state()["writes"]==[]
+            other_uid = next(entry.pw_uid for entry in pwd.getpwall() if entry.pw_uid != os.geteuid())
+            fake_ps = fake_bin / "ps"
+            fake_ps.write_text(f'#!/bin/sh\necho {other_uid}\n')
+            fake_ps.chmod(0o755)
+            try:
+                reset()
+                wrong_owner = run()
+                assert wrong_owner.returncode==1 and state()["writes"]==[]
+                assert "请以该用户执行" in wrong_owner.stderr
+            finally:
+                fake_ps.unlink()
+
             reset(bad_create_json_once=True)
             assert run().returncode==1
             assert state()["writes"].count("profile.create")==1 and len(state()["profiles"])==1

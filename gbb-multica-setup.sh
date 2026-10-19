@@ -678,7 +678,7 @@ def main():
                        ("MULTICA_TASK_ID", "MULTICA_AGENT_ID", "MULTICA_TASK_CONFIG_ROOT"))
     task_context = task_context or os.environ.get("MULTICA_TOKEN", "").startswith("mat_")
     require(opts.check or not task_context,
-            "当前是 Multica agent 任务终端。请在本机 daemon 用户已登录 Multica 的普通 SSH 终端执行；不能使用任务凭证配置。")
+            "当前是 Multica agent 任务终端。请在本机 daemon 用户已登录 Multica 的普通终端执行；不能使用任务凭证配置。")
     multica_bin, gbb_bin = shutil.which("multica"), shutil.which("gbb")
     require(multica_bin and gbb_bin, "需要已安装的 multica 和 gbb；本脚本不会自动安装软件或新建 Bot。")
     gbb_bin = os.path.abspath(gbb_bin)
@@ -716,10 +716,14 @@ def main():
     require(any(w.get("id") == workspace_id for w in daemon.get("workspaces", [])),
             "当前工作区不在本机 daemon 的工作区列表中；请检查工作区或 daemon 登录配置。")
     try:
-        daemon_uid = Path(f"/proc/{int(daemon['pid'])}").stat().st_uid
+        pid = int(daemon['pid'])
+        require(pid > 0, "daemon PID 无效。")
+        owner = subprocess.run(["ps", "-o", "uid=", "-p", str(pid)],
+                               capture_output=True, text=True, check=True, timeout=10)
+        daemon_uid = int(owner.stdout.strip())
         daemon_user = pwd.getpwuid(daemon_uid)
-    except (OSError, KeyError, ValueError):
-        raise SetupError("无法核实本机 daemon 的系统用户；本脚本面向 Linux 服务器。") from None
+    except (OSError, KeyError, ValueError, subprocess.SubprocessError):
+        raise SetupError("无法核实本机 daemon 的系统用户；请检查 daemon PID 和 ps 命令（Linux/macOS）。") from None
     require(os.geteuid() == daemon_uid,
             f"daemon 由 {daemon_user.pw_name} 运行，请以该用户执行；不会放宽 /root 或凭证文件权限。")
     print(f"工作区：{workspace.get('name', '')} ({workspace_id})")
@@ -744,7 +748,7 @@ def main():
     require(not messages_dir.exists() or os.access(messages_dir, os.R_OK | os.W_OK | os.X_OK),
             "gbb messages 目录不可读写。")
     print(f"gbb 配置及凭证可读；数据目录 {gbb_home}；目标 {target}")
-    # Credentials are checked only for this local Linux user's file store.
+    # Credentials are checked only for this local system user's file store.
     del credentials, credential
 
     bin_dir = Path(opts.bin_dir or ("/usr/local/bin" if daemon_uid == 0 else

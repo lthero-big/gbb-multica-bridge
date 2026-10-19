@@ -94,6 +94,6 @@ GBB_REPLY
 
 ## 安装与验证
 
-安装和升级统一使用仓库根目录的 `install.sh runtime` / `install.sh reply`（不带参数进入交互菜单；`install.sh ssh` 可独立配置免密连接），参数及多用户示例见 [README](../README.md)。已有 gbb 配置的 Linux 操作者也可以直接运行独立 `gbb-multica-setup.sh`；需要明确传入对应的 `--instance-id`、`--reply-route`、`--agent-name`，并让 PATH 能找到本次固定安装的 gbb。
+安装和升级统一使用仓库根目录的 `install.sh runtime` / `install.sh reply`（不带参数进入交互菜单；`install.sh ssh` 可独立配置免密连接），参数及多用户示例见 [README](../README.md)。已有 gbb 配置的 Linux/macOS 操作者也可以直接运行独立 `gbb-multica-setup.sh`；需要明确传入对应的 `--instance-id`、`--reply-route`、`--agent-name`，并让 PATH 能找到本次固定安装的 gbb。
 
 工具测试使用真实 CLI 的参数帮助与隔离数据，覆盖多轮创建、编辑、回读、权限错误、超时后的写入确认、重复调用、任务重启、结果分页和凭证保护。网络测试使用环回 webhook。安装测试使用真实离线 npm 安装及模拟 SSH，验证两个消息目录之间不会串写。真实 Bot 执行环境的授权与完整问答请按 README 验收。

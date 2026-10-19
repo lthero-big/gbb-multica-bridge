@@ -187,15 +187,16 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
 
     def test_local_reply_on_same_host_without_ssh(self):
         environment = dict(self.env)
-        command = ['bash', ROOT / 'install.sh', 'reply', '--route', 'local-alice',
-                   '--instance-id', 'alice', '--transport', 'local', '--bot', 'bridge-alice']
+        command = ['bash', ROOT / 'install.sh', 'reply', '--route', 'alice',
+                   '--instance-id', 'alice']
         before = self.ssh_log.read_bytes() if self.ssh_log.exists() else b''
         configured = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=30)
         self.assertEqual(configured.returncode, 0, configured.stderr)
         config_root = self.alice / '.config/gbb-multica'
         routes_file = config_root / 'routes.json'
-        route = json.loads(routes_file.read_text())['routes']['local-alice']
+        route = json.loads(routes_file.read_text())['routes']['alice']
         self.assertEqual(route['transport'], 'local')
+        self.assertEqual(route['bot'], 'bridge-alice')
         self.assertNotIn('ssh_alias', route)
         self.assertIn('本机同用户', (config_root / 'grok-bot-prompt.md').read_text())
         original = routes_file.read_bytes()
@@ -208,7 +209,7 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         message.write_text(json.dumps({'id': 'mlocal123', 'question': 'local', 'askedAt': '2026-01-01'}))
         helper = self.alice / '.local/bin/gbb-multica-remote'
         answer = '同机回填\n保留 $HOME 和 `内容`'
-        sent = subprocess.run([helper, 'answer', 'local-alice', 'mlocal123', '-'],
+        sent = subprocess.run([helper, 'answer', 'alice', 'mlocal123', '-'],
                               env=environment, input=answer, capture_output=True, text=True, timeout=15)
         self.assertEqual(sent.returncode, 0, sent.stderr)
         self.assertEqual(json.loads(message.read_text())['answer'], answer)
@@ -221,6 +222,66 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         canonical[2] = 'runtime'
         checked = subprocess.run(canonical + ['--check'], env=environment, capture_output=True, text=True, timeout=30)
         self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_combined_local_install_replay_and_check_without_ssh(self):
+        home = self.root / 'desktop'
+        home.mkdir()
+        store = home / 'gbb store'
+        store.mkdir()
+        (store / 'config.json').write_text(json.dumps({'hubBot': 'bridge-desktop', 'defaultBot': 'bridge-desktop'}))
+        (store / 'credentials.json').write_text(json.dumps({'bridge-desktop': {
+            'url': 'https://example.invalid/no-network', 'key': 'LOCAL_OFFLINE_ONLY'}}))
+        state = home / 'state.json'
+        state.write_text(json.dumps({'daemon_pid': os.getpid(), 'calls': [], 'writes': [], 'profiles': [], 'agents': [], 'env': {}}))
+        config_root = home / 'config store'
+        env = dict(self.env, HOME=str(home), FAKE_MULTICA_STATE=str(state),
+                   GBB_MULTICA_CONFIG_HOME=str(config_root), FAKE_SSH_LOG=str(self.ssh_log))
+        command = ['bash', ROOT / 'install.sh', 'local', '--instance-id', 'desktop', '--bot', 'bridge-desktop',
+                   '--gbb-home', str(store), '--reply-route', 'desktop-reply', '--profile', 'desktop-login']
+        before = self.ssh_log.read_bytes() if self.ssh_log.exists() else b''
+        for _ in range(2):
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=90)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('LOCAL_OFFLINE_ONLY', result.stdout + result.stderr)
+        saved = json.loads((config_root / 'server.json').read_text())
+        route = json.loads((config_root / 'routes.json').read_text())['routes']['desktop-reply']
+        self.assertEqual((route['transport'], route['instance_id'], route['bot']), ('local', 'desktop', 'bridge-desktop'))
+        self.assertNotIn('ssh_alias', route)
+        self.assertFalse((home / '.ssh').exists())
+        self.assertFalse((config_root / 'ssh.json').exists())
+        # Installation/check must not send a Grok request or create a local message.
+        self.assertFalse((store / 'messages').exists())
+        self.assertNotIn('{{', (config_root / 'grok-bot-prompt.md').read_text())
+        snapshot = {p.name: p.read_bytes() for p in config_root.iterdir() if p.is_file()}
+        checked = subprocess.run(command + ['--check'], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        # The macOS branch uses the same portable ps command; real Mac validation is separate.
+        with patch.dict(os.environ, env, clear=True), patch.object(INSTALL['platform'], 'system', return_value='Darwin'), \
+                patch.object(INSTALL['sys'], 'argv', ['install.py', *command[2:], '--check']):
+            self.assertEqual(INSTALL['main'](), 0)
+        self.assertEqual(snapshot, {p.name: p.read_bytes() for p in config_root.iterdir() if p.is_file()})
+        routes_path = config_root / 'routes.json'
+        routes_path.write_text(json.dumps({'routes': {}}))
+        missing_route = subprocess.run(command + ['--check'], env=env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(missing_route.returncode, 0)
+        self.assertIn('本机回填路由缺失', missing_route.stderr)
+        self.assertEqual(json.loads(routes_path.read_text()), {'routes': {}})
+        routes_path.write_bytes(snapshot['routes.json'])
+        after = json.loads(state.read_text())
+        self.assertEqual(after['writes'].count('profile.create'), 1)
+        self.assertEqual(after['writes'].count('agent.create'), 1)
+        self.assertEqual(after['env']['GBB_REPLY_ROUTE'], 'desktop-reply')
+        messages = store / 'messages'
+        messages.mkdir()
+        message = messages / 'mdesktop123.json'
+        message.write_text(json.dumps({'id': 'mdesktop123', 'question': 'local test', 'askedAt': '2026-01-01'}))
+        answer = '本机成功\n$HOME 和 `内容` 保持原样'
+        replied = subprocess.run([home / '.local/bin/gbb-multica-remote', 'answer', 'desktop-reply', 'mdesktop123', '-'],
+                                 env=env, input=answer, capture_output=True, text=True, timeout=15)
+        self.assertEqual(replied.returncode, 0, replied.stderr)
+        self.assertEqual(json.loads(message.read_text())['answer'], answer)
+        self.assertEqual(saved['gbb_home'], str(store))
+        self.assertEqual(self.ssh_log.read_bytes() if self.ssh_log.exists() else b'', before)
 
     def test_independent_ssh_then_reply_reuses_connection(self):
         config_root = self.mac_home / 'independent-config'
@@ -269,11 +330,13 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
                 patch('builtins.input', side_effect=['test-alias', 'example.com', 'alice', '', '', 'n']):
             self.assertEqual(INSTALL['main'](), 0)
         self.assertFalse(root.exists())
-        args = INSTALL['build_parser']().parse_args(['runtime'])
+        args = INSTALL['build_parser']().parse_args([])
         with patch.object(INSTALL['sys'].stdin, 'isatty', return_value=True), \
-                patch('builtins.input', side_effect=['node', 'bridge', '', '', 'Agent', '', '', 'y']):
+                patch('builtins.input', side_effect=['', 'node', 'bridge', '', '', 'Agent', '', '', 'y']):
             self.assertTrue(INSTALL['wizard'](args, root))
         self.assertEqual((args.profile, args.workspace_id), ('', ''))
+        self.assertEqual(args.mode, 'local')
+        self.assertIsNone(args.ssh_alias)
 
     def test_reply_wizard_completes_local_setup(self):
         config_root = self.root / 'wizard-local'
@@ -306,9 +369,10 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
                     output += os.read(master, 8192)
                 if '请选择'.encode() in output:
                     break
+            self.assertIn('本机部署'.encode(), output)
             self.assertIn('SSH'.encode(), output)
             self.assertIn('请选择'.encode(), output)
-            os.write(master, b'4\n')
+            os.write(master, b'5\n')
             self.assertEqual(child.wait(timeout=10), 0)
         finally:
             if child.poll() is None:
@@ -323,7 +387,8 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
     def test_new_cli_guards_do_not_write(self):
         bad = [ ['reply', '--transport', 'local', '--setup-ssh'],
                 ['ssh', '--workspace-id', 'unexpected'], ['ssh', '--check', '--ssh-host', 'example.com'],
-                ['reply', '--ssh-host', 'example.com'], ['runtime', '--setup-ssh'] ]
+                ['reply', '--ssh-host', 'example.com'], ['runtime', '--setup-ssh'],
+                ['local', '--ssh-alias', 'other'], ['local', '--transport', 'ssh'], ['local', '--route', 'other'] ]
         root = self.root / 'guard-no-write'
         for arguments in bad:
             result = subprocess.run(['bash', ROOT / 'install.sh', *arguments],

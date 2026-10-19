@@ -19,18 +19,19 @@ bash install.sh
 按交互菜单完成配置：
 
 1. 准备已有 Grok Bot 的 webhook URL/key，参考 [Bot 提示词](docs/grok-bot-prompt.md)。
-2. 选择**运行端**，安装 gbb 并注册 Multica runtime / Agent；按提示输入 URL/key。
-3. 选择**回传端**，配置路由，将生成的提示词交给 Bot。
+2. 同机同用户选择**本机部署（无需 SSH）**，一次配置运行端和回传端；跨机则分别配置这两端。
+3. 按提示输入 URL/key，将生成的提示词交给 Bot。
 4. 在 Multica 新聊天发送“请只回复 `GBB_RUNTIME_OK`”，确认回答正常返回。
 
-运行端需要 Linux、Python 3.9+、Node.js 20+ / npm，以及已登录且 daemon 运行中的 Multica CLI；请在 daemon 用户的普通终端安装。Multica profile、工作区可使用当前配置。
+运行端支持 Linux / macOS，需要 Python 3.9+、Node.js 20+ / npm，以及已登录且 daemon 运行中的 Multica CLI；请在 daemon 用户的普通终端安装。Multica profile、工作区可使用当前配置。
 
 回传端支持 Linux / macOS，需要 Python 3.9+；SSH 模式另需 OpenSSH。Grok 必须已获准调用这个环境，安装助手本身不会提供执行能力。安装过程不发送 Grok 请求。
 
 ## 常用入口
 
 ```bash
-bash install.sh                        # 交互菜单
+bash install.sh                        # 交互菜单（首项为本机部署）
+bash install.sh local                  # 本机部署向导，无需 SSH
 bash install.sh runtime --interactive  # 运行端向导
 bash install.sh reply --interactive    # 回传端向导
 bash install.sh ssh                    # 独立 SSH 免密配置
@@ -39,11 +40,10 @@ bash install.sh --help                 # 命令行参数
 
 同机同用户选择**本机直连**；跨机器或不同用户选择 **SSH**，同机不同用户可连接 `localhost`。SSH 配置可以单独完成，再由回传端复用。
 
-也支持带参数执行；例如同一 Linux 用户同时承担两种职责：
+也支持带参数执行；例如本机同时运行 Grok Bot 和 Multica：
 
 ```bash
-bash install.sh runtime --instance-id host-alice --bot bridge
-bash install.sh reply --route host-alice --transport local --bot bridge
+bash install.sh local --instance-id host-alice --bot bridge
 ```
 
 `host-alice` 是自定义实例/路由标识，`bridge` 是已有 Bot 的凭证名称。更新时 `git pull` 后重跑安装向导；旧 `server` / `mac` 命令兼容保留。
