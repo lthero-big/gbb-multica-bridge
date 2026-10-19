@@ -36,7 +36,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 GBB_BIN = "/usr/bin/gbb"
 NODE_BIN = "node"
 COMMAND_GROUPS = {
@@ -142,10 +142,10 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
 """
 
 INSTRUCTIONS = """You are connected through GBB_TOOL_PROTOCOL_V1.
-Your external SSH session has NO Multica task token. Do NOT run multica there.
-If reply_route is set, run the gbb-multica-remote command from payload.next on the Mac.
-It sends the reply over SSH to the correct server user. Do not run local gbb answer on the Mac.
-Use gbb answer for THIS message to return ONE JSON object:
+Only the runtime wrapper executes Multica tools with task credentials. Do NOT run multica in the reply environment.
+If reply_route is set, run the gbb-multica-remote command from payload.next in the configured reply environment.
+Its route selects the correct runtime user via a local endpoint or SSH. Do not bypass the route with gbb answer.
+Return ONE JSON object for THIS message via that reply helper (or gbb answer if no reply_route is set):
 {"gbb_tool_protocol":1,"request_id":"<request_id below>","tool_calls":[{"id":"c1","name":"multica","arguments":{"args":["project","list"]}}]}
 OR {"gbb_tool_protocol":1,"request_id":"<request_id below>","final":"your answer"}.
 Plain text is also accepted as final. Never claim a write succeeded without a successful tool result.
@@ -662,7 +662,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="仅检测，不修改文件或平台配置")
     parser.add_argument("--profile", help="Multica 登录配置名；默认使用 CLI 当前配置")
     parser.add_argument("--instance-id", help="多用户部署标识，写入 Agent 环境变量")
-    parser.add_argument("--reply-route", help="Mac 回填助手的路由名")
+    parser.add_argument("--reply-route", help="回传端助手的路由名")
     parser.add_argument("--runtime-profile-name", default=PROFILE_NAME)
     parser.add_argument("--workspace-id", help="默认使用 CLI 当前工作区，不修改保存的登录配置")
     parser.add_argument("--gbb-home", help="默认使用当前 daemon 用户的 ~/.grok-bot-bridge")
@@ -850,7 +850,7 @@ def main():
         finally:
             Path(temp_name).unlink(missing_ok=True)
     version = subprocess.run([str(wrapper), "--version"], capture_output=True, text=True, timeout=10)
-    require(version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.3.0", "包装版本检查失败。")
+    require(version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.4.0", "包装版本检查失败。")
 
     # Re-read after acquiring the lock to avoid duplicate local creations.
     profiles = cli("runtime", "profile", "list", "--output", "json")

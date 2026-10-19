@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mac reply router. Route names map to a fixed SSH alias, user and endpoint."""
+"""Reply router. Routes select a local endpoint or a fixed SSH connection."""
 import argparse
 import json
 import os
@@ -25,10 +25,9 @@ def ssh_base(route):
     return [*command, '--', alias]
 
 
-def ssh_command(route, action, message_id=None):
-    for field in ('ssh_alias', 'instance_id'):
-        if not isinstance(route.get(field), str) or not SAFE_NAME.fullmatch(route[field]):
-            raise ValueError('invalid ' + field)
+def endpoint_args(route, action, message_id=None):
+    if not isinstance(route.get('instance_id'), str) or not SAFE_NAME.fullmatch(route['instance_id']):
+        raise ValueError('invalid instance_id')
     endpoint = route.get('endpoint', '')
     if not isinstance(endpoint, str) or not endpoint.startswith('/') or any(c in endpoint for c in '\n\r\0'):
         raise ValueError('endpoint must be an absolute path')
@@ -43,7 +42,20 @@ def ssh_command(route, action, message_id=None):
         if not message_id:
             raise ValueError('answer requires message ID')
         remote.append('-')
-    return [*ssh_base(route), shlex.join(remote)]
+    return remote
+
+
+def ssh_command(route, action, message_id=None):
+    return [*ssh_base(route), shlex.join(endpoint_args(route, action, message_id))]
+
+
+def route_command(route, action, message_id=None):
+    transport = route.get('transport', 'ssh')  # Existing routes remain compatible.
+    if transport == 'local':
+        return endpoint_args(route, action, message_id)
+    if transport == 'ssh':
+        return ssh_command(route, action, message_id)
+    raise ValueError('unsupported transport')
 
 
 def main():
@@ -65,14 +77,14 @@ def main():
     config = json.loads((root / 'routes.json').read_text())
     route = config['routes'].get(args.route)
     if not route:
-        parser.error('unknown route; configure it with install.sh mac first')
-    # No shell on the Mac, no credentials in argv, no automatic retry on failure.
-    return subprocess.run(ssh_command(route, args.action, args.message_id), timeout=45).returncode
+        parser.error('unknown route; configure it with install.sh reply first')
+    # No local shell, no credentials in argv, no automatic retry on failure.
+    return subprocess.run(route_command(route, args.action, args.message_id), timeout=45).returncode
 
 
 if __name__ == '__main__':
     try:
         raise SystemExit(main())
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-        print('GBB SSH reply failed; inspect the original message before retrying', file=sys.stderr)
+        print('GBB reply failed; inspect the original message before retrying', file=sys.stderr)
         raise SystemExit(1)

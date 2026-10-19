@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 GBB_BIN = "/usr/bin/gbb"
 NODE_BIN = "node"
 COMMAND_GROUPS = {
@@ -122,10 +122,10 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
 """
 
 INSTRUCTIONS = """You are connected through GBB_TOOL_PROTOCOL_V1.
-Your external SSH session has NO Multica task token. Do NOT run multica there.
-If reply_route is set, run the gbb-multica-remote command from payload.next on the Mac.
-It sends the reply over SSH to the correct server user. Do not run local gbb answer on the Mac.
-Use gbb answer for THIS message to return ONE JSON object:
+Only the runtime wrapper executes Multica tools with task credentials. Do NOT run multica in the reply environment.
+If reply_route is set, run the gbb-multica-remote command from payload.next in the configured reply environment.
+Its route selects the correct runtime user via a local endpoint or SSH. Do not bypass the route with gbb answer.
+Return ONE JSON object for THIS message via that reply helper (or gbb answer if no reply_route is set):
 {"gbb_tool_protocol":1,"request_id":"<request_id below>","tool_calls":[{"id":"c1","name":"multica","arguments":{"args":["project","list"]}}]}
 OR {"gbb_tool_protocol":1,"request_id":"<request_id below>","final":"your answer"}.
 Plain text is also accepted as final. Never claim a write succeeded without a successful tool result.

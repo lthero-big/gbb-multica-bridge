@@ -1,4 +1,4 @@
-"""Bootstrap a Mac SSH identity using OpenSSH's own password prompt."""
+"""Bootstrap a local SSH identity using OpenSSH's own password prompt."""
 import base64
 import ipaddress
 import os
@@ -59,7 +59,7 @@ def public_part(value):
 def setup_ssh(alias, *, host, user, port, key_path, write_file):
     """Return a managed config path only after public-key authentication works."""
     if not shutil.which('ssh-keygen'):
-        raise ValueError('需要 ssh-keygen；Mac 系统通常已提供')
+        raise ValueError('需要 OpenSSH 的 ssh-keygen')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', alias):
         raise ValueError('SSH alias 无效')
     if host.startswith('[') and host.endswith(']'):
@@ -88,10 +88,10 @@ def setup_ssh(alias, *, host, user, port, key_path, write_file):
         if identity.with_name(identity.name + '.pub').exists():
             raise ValueError('已存在同名公钥但没有私钥；不会覆盖，请换一个 --ssh-key 路径')
         identity.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Dedicated unencrypted key supports unattended Bot replies; it never leaves the Mac.
+        # Dedicated unencrypted key supports unattended Bot replies; it never leaves this host.
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(identity),
                         '-C', 'gbb-multica:' + alias], check=True, stdin=subprocess.DEVNULL, timeout=30)
-        print(f'已生成专用 Ed25519 密钥：{identity}（私钥仅保存在 Mac）。', flush=True)
+        print(f'已生成专用 Ed25519 密钥：{identity}（私钥仅保存在本机）。', flush=True)
     if not identity.is_file() or identity.stat().st_uid != os.geteuid() or identity.stat().st_mode & 0o077:
         raise ValueError('私钥必须属于当前用户，且仅该用户可读写（通常权限 600）')
     # Derive from the selected private key, so a stale .pub cannot authorize a different identity.
@@ -110,7 +110,7 @@ def setup_ssh(alias, *, host, user, port, key_path, write_file):
     checked = subprocess.run(probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     if checked.returncode:
         if not sys.stdin.isatty():
-            raise ValueError('首次复制公钥需要交互终端，请直接在 Mac 终端运行；密码由 SSH 读取')
+            raise ValueError('首次复制公钥需要交互终端，请直接在本机终端运行；密码由 SSH 读取')
         print(f'向 {user}@{host}:{port} 追加公钥。请核对主机指纹，并在 SSH 提示时输入服务器密码。', flush=True)
         # SSH reads its password from /dev/tty; stdin carries ONLY the public key.
         copied = subprocess.run([*base, '-o', 'BatchMode=no', '-o', 'NumberOfPasswordPrompts=1',

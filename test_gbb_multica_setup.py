@@ -127,7 +127,7 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             wrapper=install_dir/"gbb-multica-agent"
             assert os.access(wrapper,os.X_OK)
             version=subprocess.run([str(wrapper),"--version"],env=env,capture_output=True,text=True,check=True)
-            assert version.stdout.strip()=="gbb-multica-agent 0.3.0"
+            assert version.stdout.strip()=="gbb-multica-agent 0.4.0"
             passed(run())
             second=state()
             assert second["writes"].count("profile.create")==1 and second["writes"].count("agent.create")==1

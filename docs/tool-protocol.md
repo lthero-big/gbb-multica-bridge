@@ -1,6 +1,6 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.3.0；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。Mac 通过回填助手使用 SSH；服务器本地手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.4.0；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
 
@@ -40,7 +40,7 @@
 
 ## 手动回填协议
 
-每一轮在服务器上查询：
+每一轮通过回传端助手查询；运行端同用户也可直接使用对应 GBB_HOME 的 gbb inbox：
 
 ```bash
 "$HOME/.local/bin/gbb-multica-remote" inbox ROUTE
@@ -79,7 +79,7 @@ GBB_REPLY
 
 编辑后再用 `issue get` 回读。不要用示例占位符执行实际写入。
 
-参数不确定时使用 `multica_help`，如 `{"command":["project","update"]}`；空数组列出支持的操作。命令参数以字符串数组传递，省略 `multica`、`--output` 和全局选项。正文或附件路径只能引用 `files` 中的 `@文件名`，不能读取服务器上的既有文件。评论必须使用 `--content-file`；编辑评论还需要查询结果中的 `--expected-revision`。
+参数不确定时使用 `multica_help`，如 `{"command":["project","update"]}`；空数组列出支持的操作。命令参数以字符串数组传递，省略 `multica`、`--output` 和全局选项。正文或附件路径只能引用 `files` 中的 `@文件名`，不能读取运行端上的既有文件。评论必须使用 `--content-file`；编辑评论还需要查询结果中的 `--expected-revision`。
 
 查询大结果时可用 `fields` 选取顶层字段。超过 25,000 字符的结果返回 `result_id` 和 `next_offset`，通过 `multica_result` 分页读取，最多每次 40,000 字符。
 
@@ -94,6 +94,6 @@ GBB_REPLY
 
 ## 安装与验证
 
-安装和升级统一使用仓库根目录的 `install.sh server` / `install.sh mac`，参数及多用户示例见 [README](../README.md)。已有 gbb 配置的 Linux 操作者也可以直接运行独立 `gbb-multica-setup.sh`；需要明确传入对应的 `--instance-id`、`--reply-route`、`--agent-name`，并让 PATH 能找到本次固定安装的 gbb。
+安装和升级统一使用仓库根目录的 `install.sh runtime` / `install.sh reply`（不带参数进入交互菜单；`install.sh ssh` 可独立配置免密连接），参数及多用户示例见 [README](../README.md)。已有 gbb 配置的 Linux 操作者也可以直接运行独立 `gbb-multica-setup.sh`；需要明确传入对应的 `--instance-id`、`--reply-route`、`--agent-name`，并让 PATH 能找到本次固定安装的 gbb。
 
-工具测试使用真实 CLI 的参数帮助与隔离数据，覆盖多轮创建、编辑、回读、权限错误、超时后的写入确认、重复调用、任务重启、结果分页和凭证保护。网络测试使用环回 webhook。安装测试使用真实离线 npm 安装及模拟 SSH，验证两个消息目录之间不会串写。真实 Mac 的电脑执行授权与完整问答请按 README 验收。
+工具测试使用真实 CLI 的参数帮助与隔离数据，覆盖多轮创建、编辑、回读、权限错误、超时后的写入确认、重复调用、任务重启、结果分页和凭证保护。网络测试使用环回 webhook。安装测试使用真实离线 npm 安装及模拟 SSH，验证两个消息目录之间不会串写。真实 Bot 执行环境的授权与完整问答请按 README 验收。

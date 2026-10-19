@@ -1,282 +1,301 @@
 # Grok Bot Bridge × Multica
 
-让 Linux 服务器上的 Multica Agent 把任务交给 Grok Bot，并把回答与 Multica 查询、创建、编辑结果带回聊天。Mac 运行 Grok Bot 客户端，使用已有 SSH 连接把答案写回正确的服务器用户。
+让 Multica Agent 把任务交给 Grok Bot，再把回答以及 Multica 查询、创建、编辑结果带回聊天。
 
-当前包装版本 **0.3.0**，固定安装随仓库提供的 **gbb 0.2.0**。仓库先保持私有；安装需要有权限的 GitHub 登录。
+按职责分为**运行端**与**回传端**，不按“服务器 / Mac”划分。运行端运行 Multica daemon、包装和 gbb；回传端是 Grok 的工具执行能力能够调用回填助手的环境。两端可以在不同机器，也可以在同一机器。当前包装版本 **0.4.0**，固定安装仓库提供的 **gbb 0.2.0**。仓库保持私有。
 
 ```mermaid
 flowchart LR
-  A[服务器：Multica daemon / Agent] --> B[本用户的包装 + gbb]
+  A[运行端：Multica daemon / Agent] --> B[本用户的包装 + gbb]
   B -->|HTTPS webhook| C[Grok Bot]
-  C -->|Mac 电脑执行能力| D[Mac：gbb-multica-remote]
-  D -->|SSH alias 固定服务器用户| E[服务器：endpoint / gbb answer]
+  C -->|已接通的电脑或工具执行能力| D[回传端：回填助手]
+  D -->|本机同用户直连 或 SSH| E[运行端：endpoint / gbb answer]
   E --> B
   B -->|任务凭证执行 Multica 工具| A
 ```
 
-不需要 HTTP 入站服务或公网隧道。服务器要能访问 webhook；Mac 要能通过 SSH 访问服务器。Bot 的电脑执行能力也必须具备这条 SSH 访问能力。
+无需 HTTP 入站服务或公网隧道。运行端需要访问 webhook；使用 SSH 时，回传端需要能连接运行端。**安装回传助手本身不会赋予 Grok 执行能力**，还须让 Grok 的电脑/工具环境能够执行该助手。Mac 客户端是一个可用场景，Linux 执行环境也可以配置回传端。
 
-## 多用户：要不要多个 Bot？
+## 交互式开始
 
-**不强制一人一个 Bot。建议按用户/实例分别命名，独立使用时也分别创建 Bot 和 webhook。** 共用 Bot 时，必须按请求的 `reply_route` 回填。
-
-| 配置层 | 作用 | 多用户怎么处理 |
-| --- | --- | --- |
-| Linux 系统用户 | 文件权限、HOME、进程身份 | 各自运行自己的 daemon，保存自己的 gbb 配置与消息 |
-| Multica 登录 profile | 当前登录账号/工作区与本机配置 | 各系统用户可都用 `default`；需要命名配置时传 `--profile` |
-| Custom runtime profile | 包装的启动协议与命令定义 | 同一工作区可复用 `Grok Bot Bridge` 定义；本机路径按 daemon 账号配置 |
-| Runtime | 某个 daemon 实际发现的运行目标 | 安装脚本同时匹配 profile ID、当前 daemon ID 和 online 状态 |
-| Agent | 用户在 Multica 中聊天和执行任务的对象 | 每个实例使用独立名称，绑定自己的 runtime、GBB_HOME、实例和路由 |
-| Grok Bot / webhook | 接收任务并产生回复 | 可共用；分开更便于查看、限流和维护，不能用名称代替路由校验 |
-| Mac 回填路由 | 映射到 SSH 用户和服务器实例 | 每个实例一个固定 route，例如 `linux-alice`、`linux-bob` |
-
-多个命名 profile 不等于操作系统隔离。此安装器按**每个 Linux 用户一个 gbb 实例**设计；同一用户要切换实例时会停止并提示核对。账号之间需要权限隔离时，使用独立系统用户、容器或 VM。共用 Bot/同一 Mac 的电脑执行权限也意味着共享一部分访问能力，Bot 名称本身不提供隔离。
-
-## 准备条件
-
-- 服务器：Linux、Python 3.9+、Node.js 20+ 与 npm；已安装 Multica CLI，并以实际 daemon 用户登录目标工作区、启动 daemon。已验证 Multica CLI 0.6.3、Node 22.22.0。
-- Mac：Python 3.9+、系统 SSH 客户端、Grok Bot 客户端及电脑执行能力。Mac 不必安装 Multica 或本地 gbb。
-- SSH 可以使用已有免密 alias，也可以在 Mac 安装时加 `--setup-ssh`，通过一次密码登录追加公钥。首次配置要求目标账号允许密码认证，并使用 `~/.ssh/authorized_keys` 授权公钥；后续回填使用 `BatchMode=yes`。
-- GitHub 私有仓库读取权限。每台机器可用 `gh repo clone lthero-big/gbb-multica-bridge`，或用已配置凭证的 `git clone`。
-
-## 安装参数说明
-
-`server` 和 `mac` 是运行模式，分别在 Linux 服务器和 Grok Bot 所在 Mac 执行。下文的 `alice` 只是示例，不要求创建一个叫 alice 的系统用户、Multica 登录配置或 Bot。先阅读参数含义，再替换成自己的名称。
-
-### 服务器参数
-
-| 参数 | 用途与填写方式 | 不填时的行为 |
-| --- | --- | --- |
-| `--instance-id linux-alice` | 给“这台服务器上的这个用户的 gbb 部署”起一个稳定标识。可自定，如 `linux-root`、`server-bob`；不是账号、工作区 ID 或 Bot ID。建议带上服务器和用户，便于区分。 | 重用上次实例名；首次按“主机短名-当前用户名”生成。已有实例后不能直接用另一个名字重装。 |
-| `--bot bridge-linux-alice` | gbb 保存这组 webhook URL/key 的本地名称，同时作为请求目标。建议与实际 Grok Bot 的名称一致；已有配置名为 `bridge` 时就填 `bridge`。此参数不会创建或重命名 Grok Bot。 | 重用上次名称；首次交互询问，建议值为 `bridge-实例名`。 |
-| `--profile alice` | 选择**已经存在且已登录的 Multica 登录配置**。与平时执行 `multica --profile alice ...` 的含义相同；不是 Linux 用户名，也不是自动注册的 custom runtime profile。 | 重用上次选择；首次使用 CLI 当前登录配置。本机使用默认登录配置，可直接省略。 |
-| `--workspace-id 实际工作区UUID` | 指定 Agent/runtime 所属工作区的真实 UUID。从 `multica workspace get --output json` 返回的 `id` 获取；不能填工作区名称或照抄“实际工作区UUID”。 | 重用上次工作区；首次读取所选 Multica 登录配置的当前工作区。 |
-| `--reply-route linux-alice` | 告诉 Grok 将答案交给 Mac 上哪条回填路由。必须与 Mac 安装命令的 `--route` 相同。 | 重用上次路由；首次与 `--instance-id` 相同，通常不用单独指定。 |
-| `--agent-name 'Grok Bot Bridge 测试'` | 在 Multica 中创建或复用的 Agent 名称。名称含空格时加引号；要升级已有 Agent，就填其原名。 | 重用上次名称；首次为 `Grok Bot Bridge · 实例名`。 |
-| `--gbb-home /home/alice/.grok-bot-bridge` | 当前 daemon 用户的 gbb 数据目录，保存配置、凭证、消息等。应是该用户自己的目录。 | 重用上次目录；首次为该用户的 `~/.grok-bot-bridge`。 |
-
-首次使用默认登录配置和当前工作区时，只需指定易识别的实例名与现有 Bot 名称：
-
-```bash
-bash install.sh server --instance-id linux-alice --bot bridge-linux-alice
-```
-
-只有你平时确实使用命名的 Multica 登录配置时，才加 `--profile`。要确认工作区，可以在服务器的普通登录终端运行：
-
-```bash
-# 默认登录配置的当前工作区；读取结果中的 id
-multica workspace get --output json
-
-# 若平时使用名为 alice 的登录配置，查询该配置的工作区
-multica --profile alice workspace get --output json
-```
-
-### Mac 参数
-
-| 参数 | 用途与填写方式 | 不填时的行为 |
-| --- | --- | --- |
-| `--route linux-alice` | Mac 上这条 SSH 回填路径的名称，必须与服务器的 `--reply-route` 相同；服务器未显式设置 reply-route 时，就是其 instance-id。 | 也可用 `--instance-id` 提供同名路由；两者均未传时交互询问，非交互模式报错。 |
-| `--ssh-alias multica-alice` | 要使用的 **Host 别名**。普通模式使用 Mac `~/.ssh/config` 中已有的别名；加 `--setup-ssh` 时自动配置专用别名。对应的 `User` 必须是服务器实际运行 daemon 的系统用户。 | 重用这条路由上次的 alias；普通新路由会询问；setup-ssh 模式默认 `multica-路由名`。 |
-| `--setup-ssh` | 首次安装时自动生成/复用密钥，通过一次密码登录向目标账号追加公钥，验证免密后继续配置回填路由。 | 使用已有 SSH alias，不修改公钥配置。不能与只读 `--check` 同用。 |
-| `--ssh-host your-server.example` | setup-ssh 模式的服务器域名/IP，只填地址，不含用户名、协议或端口。 | 复用这条路由上次的服务器地址；首次交互询问。 |
-| `--ssh-user alice` | setup-ssh 模式的服务器系统用户，必须与 daemon 用户一致；不是 Multica profile。 | 复用上次用户；首次交互询问。 |
-| `--ssh-port 22` | setup-ssh 模式的 SSH 端口，范围 1–65535。例如服务器端口为 2222，就填 `--ssh-port 2222`。 | 复用上次端口；首次为 22。 |
-| `--ssh-key "$HOME/.ssh/id_ed25519"` | setup-ssh 模式使用的 **Mac 私钥**路径，相当于 `ssh -i` 选择的身份。已有文件会复用；不存在时生成 Ed25519 密钥对。 | 复用上次私钥路径；首次为 `~/.ssh/gbb_multica_别名_ed25519`。私钥留在 Mac，只复制公钥。 |
-| `--bot bridge-linux-alice` | 生成 Bot 提示词时使用的名称标注。建议与服务器 `--bot` 保持一致；它不负责选择 SSH 账号或校验 webhook。 | 重用这条路由上次的名称；首次为 `bridge-实例名`。已有 Bot 叫 `bridge` 时请显式传 `--bot bridge`。 |
-| `--instance-id linux-alice` | 服务器的真实部署标识，用于检查是否连接了正确实例。仅在 route 名与服务器实例名不同等情况下需要单独填写。 | 重用这条路由上次的实例名；首次与 `--route` 相同。 |
-| `--endpoint /home/alice/.local/bin/gbb-multica-endpoint` | SSH 登录服务器后要执行的回填入口的**服务器绝对路径**。不要填 Mac 路径。 | 重用上次路径；新路由通过 SSH 自动发现远端 `~/.local/bin/gbb-multica-endpoint`，通常不用填。 |
-
-例如 Mac 的 SSH 配置是：
-
-```sshconfig
-Host multica-alice
-    HostName your-server.example
-    User alice
-```
-
-那么 `--ssh-alias` 填 `multica-alice`；`alice` 是 SSH 登录的系统用户。它恰好与某个 Multica profile 同名也只是命名选择，两者独立。完整 SSH 密钥示例见后面的快速开始。
-
-`--ssh-host`、`--ssh-user`、`--ssh-port`、`--ssh-key` 仅用于 Mac 的 `--setup-ssh` 模式。专用配置保存在 Mac 的 `~/.ssh/gbb-multica/别名.conf`，回填助手自动带 `ssh -F` 使用它；原有 `~/.ssh/config` 会保留。
-
-### 两端怎样对应
-
-| 服务器设置 | Mac 设置 | 对应规则 |
-| --- | --- | --- |
-| `--instance-id linux-alice`，省略 reply-route | `--route linux-alice` | 最常用；route、实例名均为 `linux-alice`。 |
-| `--instance-id linux-alice --reply-route alice-reply` | `--route alice-reply --instance-id linux-alice` | 自定义路由名时，路由对应路由、实例对应实例。 |
-| `--bot bridge-linux-alice` | `--bot bridge-linux-alice` | 保持提示词标注一致；回填目标由 route 决定。 |
-| 以 Linux 用户 `alice` 运行 daemon/安装 | SSH alias 对应 `User alice` | 必须进入同一系统用户，才能读写同一套 gbb 消息。 |
-
-实例名、route 和 SSH alias 只能包含字母、数字、点、下划线和连字符，长度 1–80；名称须以字母或数字开头。Bot 名称、Agent 名称可含空格，但命令中需加引号。
-
-`--check` 和 `--dry-run` 两种模式均可用：前者检查配置，不修改文件或发送 Grok 请求，但会连接平台/SSH；后者仅显示步骤，不执行连接。安装时会保存已选参数，后续重跑可复用。随时可运行 `bash install.sh --help` 查看说明。
-
-多行命令每个续行前一行的结尾必须带 `\`，且 `\` 后不要加空格。也可把整个命令写成一行；仅换行而省略 `\` 会使后续参数变成独立命令。
-
-## 快速开始
-
-### 1. 两台机器分别取代码
+先在需要配置的机器取代码；同机只需一份：
 
 ```bash
 gh repo clone lthero-big/gbb-multica-bridge
 cd gbb-multica-bridge
+bash install.sh
 ```
 
-私有仓库使用认证 clone，不采用匿名的 raw URL 或 `curl | bash`。
+私有仓库需要已认证的 GitHub 账号；也可使用已有凭证的 `git clone`。更新已有代码时执行 `git pull`。
 
-### 2. 准备 Bot 的 webhook
+不带参数会显示菜单：
 
-在 Mac 的 Grok Bot 中复用已有 Bot，参考 [Bot 提示词](docs/grok-bot-prompt.md) 创建或更新 webhook routine。按用户命名，例如 `bridge-linux-alice`。从 routine 面板取得 URL/key，下一步在服务器终端交互输入。已有 Bot、URL/key 不需要重新创建。
-
-### 3. 服务器一键安装
-
-在 **daemon 用户的普通登录终端**执行，不要在 Multica agent 任务终端执行安装：
-
-```bash
-bash install.sh server --instance-id linux-alice --bot bridge-linux-alice
+```text
+1. 运行端：安装 gbb，注册 Multica runtime / Agent
+2. 回传端：配置本机或 SSH 回填路由，生成 Bot 提示词
+3. SSH：单独配置免密登录，无需安装运行端/回传端
+4. 退出
 ```
 
-使用命名的 Multica 登录配置或指定工作区时：
+按提示输入或接受默认值，执行前会展示配置并要求确认；输入 `n` 或按 Ctrl+C 取消。向导优先复用已有设置。运行端的 Multica profile、工作区可以留空，使用当前登录配置；输入 `-` 可清除旧的可选设置。
+
+也可以直接进入某个向导，或预填部分参数：
 
 ```bash
-bash install.sh server \
-  --instance-id linux-alice \
-  --bot bridge-linux-alice \
-  --profile alice \
+bash install.sh runtime --interactive
+bash install.sh reply --interactive
+bash install.sh ssh
+bash install.sh reply --interactive --route host-alice
+```
+
+指定模式但不带其他参数时，若在交互终端，也会进入该模式的完整向导。带参数命令仍然可用；缺少必填项时会询问。非交互环境必须明确指定模式和必填参数；已有 webhook 或 SSH 认证配置可直接复用。URL/key 和密码不应通过命令参数传入。
+
+## 角色与准备条件
+
+| 入口 | 职责 | 条件 |
+| --- | --- | --- |
+| `runtime` 运行端 | 安装固定版本 gbb、包装、endpoint，注册/复用 Multica runtime 和 Agent | 当前支持 Linux；Python 3.9+、Node.js 20+、npm；已登录 Multica CLI 且 daemon 运行 |
+| `reply` 回传端 | 安装回填助手、维护路由、生成 Bot 提示词 | Linux 或 macOS；Python 3.9+；SSH 路由另需 OpenSSH；Grok 能调用这个环境 |
+| `ssh` 连接配置 | 单独生成/复用密钥、追加公钥、检查免密连接 | Linux 或 macOS；Python 3.9+、OpenSSH；不需要 Multica、gbb 或 endpoint |
+
+运行端安装必须在 **daemon 用户已登录 Multica 的普通终端**执行，不能借用聊天任务注入的 `mat_` token。已验证 Multica CLI 0.6.3、Node 22.22.0。回传端无需 Multica 登录凭证；SSH 回传端也不需要本地 gbb。
+
+旧命令 `server` 是 `runtime` 的兼容别名，`mac` 是 `reply` 的兼容别名；原命令和已有路由可继续使用。为兼容已安装的 endpoint，运行端配置文件仍叫 `server.json`，无需手动迁移。
+
+## 选择连接方式
+
+| 部署情况 | 回传方式 | 配置 |
+| --- | --- | --- |
+| 同一台机器、同一系统用户 | `local`，直接调用本机 endpoint | 无需 SSH、SSH key 或 SSH 服务 |
+| 同一台机器、不同系统用户 | `ssh`，登录运行端用户 | SSH 目标可用 `localhost`，需要该机 SSH 服务 |
+| 不同机器，例如 Mac → Linux、Linux → Linux | `ssh` | 使用已有免密连接，或先运行独立 SSH 向导 |
+
+本机模式使用**当前用户**的运行端配置，不自动切换账号，也不放宽 `/root` 权限。运行端当前支持 Linux，因此同机部署也以 Linux 为前提。
+
+## 安装流程
+
+### 1. 准备已有 Bot 的 webhook
+
+把 [Bot 提示词模板](docs/grok-bot-prompt.md) 交给已有 Grok Bot，创建或更新 webhook routine，从面板取得 URL/key。已有 Bot 和 routine 可复用；不必再创建。名称可用 `bridge-host-alice` 方便识别。两端安装后，再把回传端生成的实际提示词交给 Bot，替换模板占位符。
+
+### 2. 配置运行端
+
+推荐菜单选择“运行端”。命令行等价示例：
+
+```bash
+bash install.sh runtime --instance-id host-alice --bot bridge-host-alice
+```
+
+只有平时使用命名 Multica 登录配置时才加 `--profile`；不需要创建一个叫 alice 的 profile。要指定工作区，可运行 `multica workspace get --output json` 查 `id`，然后传入真实 UUID：
+
+```bash
+bash install.sh runtime \
+  --instance-id host-alice \
+  --bot bridge-host-alice \
+  --profile alice-login \
   --workspace-id 实际工作区UUID
 ```
 
-脚本校验本地归档、离线安装 gbb 0.2.0 到当前用户目录、复用或交互保存 URL/key、安装包装与 SSH endpoint、注册或复用 runtime profile 和 Agent。不需要修改脚本；不会创建 Grok Bot、发送 Grok 请求或安装其他 CLI 的技能。URL/key 不出现在命令参数里。
+脚本校验归档并离线安装 gbb 0.2.0 到 `~/.local/share/gbb-multica/npm`，复用或交互保存 URL/key，安装包装和 endpoint，然后注册/复用 profile、Agent。不会发送 Grok 请求或创建 Grok Bot。URL/key 通过标准输入交给 gbb 的凭证存储，不放入进程参数。
 
-默认 Agent 名称为 `Grok Bot Bridge · linux-alice`。可用 `--agent-name` 指定，升级现有测试 Agent 时请显式传其原名。先结束该 Agent 正在运行的请求；安装脚本会拒绝修改仍有任务的 Agent。
+默认 Agent 名为 `Grok Bot Bridge · host-alice`。升级已有 Agent 时，用 `--agent-name` 填原名称；先结束正在运行的请求。安装脚本拒绝修改仍有任务的 Agent。
 
-### 4. Mac 一键配置回填
+### 3. 配置回传端
 
-**首次配置 SSH：推荐使用自动引导。** 在 Mac 的交互终端运行：
+菜单选择“回传端”，再选择本机或 SSH。如果需要新建 SSH 免密连接，可在向导里选择，也可以提前单独配置。
+
+同机同用户的命令行示例：
 
 ```bash
-bash install.sh mac --route linux-alice --bot bridge-linux-alice --setup-ssh
+bash install.sh reply --route host-alice --transport local --bot bridge-host-alice
 ```
 
-按提示填写服务器域名/IP、运行 daemon 的系统用户名；SSH alias 可接受默认值。第一次连接时 SSH 可能要求确认主机指纹，核对后继续；随后输入一次服务器密码。密码由 SSH 自己读取，不进入脚本变量、命令参数或配置文件。
-
-如果已经知道连接信息，可以直接填写（将示例地址和用户换成实际值）：
+跨机器或用户，使用已有免密 SSH alias：
 
 ```bash
-bash install.sh mac \
-  --route linux-alice \
-  --bot bridge-linux-alice \
-  --setup-ssh \
-  --ssh-host your-server.example \
+bash install.sh reply --route host-alice --ssh-alias multica-alice --bot bridge-host-alice
+```
+
+脚本发现 endpoint 的绝对路径，验证目标实例、gbb 0.2.0 和配置可读状态，然后合并保存路由，安装 `~/.local/bin/gbb-multica-remote`，生成 `~/.config/gbb-multica/grok-bot-prompt.md`。把该提示词交给对应 Bot，并让它的工具执行环境能够运行这个助手。
+
+默认 `route` 与运行端实例名相同。运行端使用不同的 `--reply-route` 时，回传端须同时设置 `--route 回填路由名 --instance-id 实际实例名`。
+
+### 4. 验证完整问答
+
+在 Multica 为该 Agent 新开聊天，只发送一次：
+
+> 请只回复 `GBB_RUNTIME_OK`。
+
+Grok 根据本轮 `next`，在回传端执行类似命令，使用实际助手路径、route 和消息 ID：
+
+```bash
+"$HOME/.local/bin/gbb-multica-remote" answer host-alice 本轮消息ID - <<'GBB_REPLY'
+GBB_RUNTIME_OK
+GBB_REPLY
+```
+
+Multica 显示回答且运行成功结束，才代表完整打通。`--check` 成功只能证明配置链路；Bot 的实际执行授权需要完成这次问答验证。之后可以请求“列出当前工作区项目”；创建、编辑时应明确目标和字段，由运行端包装使用当前任务身份执行。
+
+默认整次任务等待 900 秒，最多 8 次 Grok 请求。请在本轮任务仍等待时回填；超时后补写答案不会恢复已结束的任务，不要盲目重发请求。
+
+## 独立 SSH 入口
+
+无需先安装任何一端，直接运行：
+
+```bash
+bash install.sh ssh
+```
+
+按提示输入连接别名、目标域名/IP、系统用户名、端口和本机私钥路径。也支持命令行：
+
+```bash
+bash install.sh ssh \
+  --ssh-alias multica-alice \
+  --ssh-host your-host.example \
   --ssh-user alice \
-  --ssh-port 22 \
-  --ssh-alias multica-alice
+  --ssh-port 22
 ```
 
-流程为：生成/复用 Mac 专用密钥 → 用 `ssh -i` 指定该密钥尝试连接 → 必要时只请求一次服务器密码并追加公钥 → 验证免密登录 → 配置回填路由。它保留服务器其他 `authorized_keys` 条目，按公钥内容去重；重复安装且免密已可用时不再请求密码。
+流程为：生成/复用专用密钥 → `ssh -i` 尝试连接 → 必要时输入一次目标账号密码追加公钥 → 验证免密 → 保存独立连接。密码由 SSH 自己从终端读取，不进入脚本变量、参数或配置文件。首次连接时仍需核对并确认主机指纹。保留其他 `authorized_keys` 条目，按公钥内容去重；免密已可用时不会再次要求密码。
 
-默认新建的是无口令专用 Ed25519 私钥，权限为 600，供 Bot 无人值守回填；私钥只留在 Mac。若指定已有加密私钥，请先将其加载到 `ssh-agent`，以便后续 `BatchMode=yes` 的连接能使用它；安装时从私钥核对公钥还可能要求输入这把私钥的解密口令，与服务器登录密码分开。脚本不会修改服务器的密码认证策略；服务器禁止密码登录、仅支持交互式 MFA 或使用其他公钥授权路径时，先自行配置免密 alias，再使用下方的已有连接方式。
+私钥默认 `~/.ssh/gbb_multica_别名_ed25519`，新建时为无口令 Ed25519，权限 600，供自动回填使用；私钥只留在发起 SSH 的这台机器。指定已有私钥可加 `--ssh-key "$HOME/.ssh/id_ed25519"`。已有加密私钥请先加载到 `ssh-agent`；安装时从私钥核对公钥也可能要求密钥口令，这与目标登录密码分开。
 
-脚本使用专用配置 `~/.ssh/gbb-multica/multica-alice.conf`（文件名随 alias 变化）。回填助手会自动使用它；手工连接可执行：
+目标需允许密码认证且使用 `~/.ssh/authorized_keys`。不支持密码认证、使用 MFA 或其他公钥路径的环境，应自行配置免密 alias 后使用。脚本不会修改目标的密码认证策略。
+
+专用配置保存于 `~/.ssh/gbb-multica/别名.conf`，连接目录保存于 `~/.config/gbb-multica/ssh.json`。回传端通过 `--ssh-alias` 自动复用；原有 `~/.ssh/config` 保留。手动登录及只读检查：
 
 ```bash
 ssh -F "$HOME/.ssh/gbb-multica/multica-alice.conf" multica-alice
+bash install.sh ssh --ssh-alias multica-alice --check
 ```
 
-这些身份和配置选项使用系统 OpenSSH，参见 [ssh 的 -i/-F 参数](https://man.openbsd.org/ssh.1) 与 [SSH 配置说明](https://man.openbsd.org/ssh_config.5)。
-
-**已有免密 SSH alias：继续直接复用。** 例如 `~/.ssh/config` 已有如下别名，先自行确认 `ssh multica-alice` 能登录：
+已有 `~/.ssh/config` alias 也可以直接用于回传端，不必导入。例如：
 
 ```sshconfig
 Host multica-alice
-    HostName your-server.example
+    HostName your-host.example
     User alice
     IdentityFile ~/.ssh/id_ed25519_multica_alice
     IdentitiesOnly yes
 ```
 
-然后执行：
+需要在配置回传端时一起引导 SSH，保留了这个入口：
 
 ```bash
-bash install.sh mac --route linux-alice --ssh-alias multica-alice --bot bridge-linux-alice
+bash install.sh reply --route host-alice --setup-ssh --ssh-host your-host.example --ssh-user alice
 ```
 
-脚本通过 SSH 发现 endpoint 的绝对路径，检查服务器实例、gbb 版本和凭证可读状态，再安装 Mac 回填助手、保存路由并生成实际 Bot 提示词。将生成的 `~/.config/gbb-multica/grok-bot-prompt.md` 给对应 Bot，确认其电脑执行能力可以调用这个助手。
+连接使用系统 OpenSSH；参见 [ssh 的 -i/-F 参数](https://man.openbsd.org/ssh.1) 与 [SSH 配置说明](https://man.openbsd.org/ssh_config.5)。
 
-默认 route 与实例名相同。若服务器显式设置了不同的 `--reply-route`，Mac 需同时传 `--route 回填路由名 --instance-id 服务器实例名`，两者不可混用。
+## 参数说明
 
-SSH 只会返回配置检查结果；不会把服务器的 webhook key 或 Multica token 复制到 Mac。若服务器 endpoint 不在默认目录，可加 `--endpoint /实际绝对路径/gbb-multica-endpoint`。
+未指定参数通常复用上次设置；首次使用的默认值见下表。`alice`、`host-alice` 都是示例名称，不要求创建同名系统用户、profile 或 Bot。
 
-### 5. 验证完整问答
+| 参数 | 用于 | 含义与首次默认值 |
+| --- | --- | --- |
+| `--interactive` / `-i` | 三个入口 | 逐项询问和确认，可与预填参数一起使用 |
+| `--check` | 三个入口 | 只读检查，不发 Grok 请求；runtime 连接 Multica；reply 检查 endpoint；ssh 仅验证免密登录 |
+| `--dry-run` | 三个入口 | 仅展示步骤，不连接或写文件 |
+| `--instance-id host-alice` | runtime / reply | 部署稳定标识；runtime 默认“主机短名-用户名”，reply 默认 route；不是 profile、工作区或 Bot ID |
+| `--bot bridge-host-alice` | runtime / reply | runtime 的 gbb 凭证 alias/请求目标；reply 的 Bot 名称标注；默认 `bridge-实例名`；已有名称是 `bridge` 时填 `bridge` |
+| `--profile alice-login` | runtime | 已有 Multica 登录配置名；默认 CLI 当前配置，不创建新配置，也不是系统用户名 |
+| `--workspace-id UUID` | runtime | 真实工作区 UUID；默认读取当前工作区，并核对本机 daemon 关联 |
+| `--reply-route ROUTE` | runtime | 请求发给 Grok 的回填路由；默认 instance-id，必须对应 reply 的 route |
+| `--agent-name NAME` | runtime | 要创建/复用的 Agent；默认 `Grok Bot Bridge · 实例名`；升级旧 Agent 用原名称 |
+| `--gbb-home DIR` | runtime | 当前 daemon 用户的 gbb 数据目录；默认 `~/.grok-bot-bridge` |
+| `--route ROUTE` | reply | 回填路由，必须对应 runtime 的 reply-route；也可用 instance-id 提供同名路由，否则询问 |
+| `--transport local/ssh` | reply | 同机同用户直连或 SSH；命令行首次默认 ssh，后续复用路由设置；向导会让用户选择 |
+| `--endpoint PATH` | reply | **运行端** endpoint 绝对路径；默认发现其 `~/.local/bin/gbb-multica-endpoint`，不是回传端任意路径 |
+| `--ssh-alias HOST` | ssh / reply | 连接别名；可复用独立 SSH 配置或 `~/.ssh/config`；回填目标用户必须是 daemon 用户 |
+| `--setup-ssh` | reply | 配回传路由前先引导 SSH；独立 ssh 入口不需要此参数；不能与 check/local 同用 |
+| `--ssh-host HOST` | ssh / reply 的 setup-ssh | 目标域名/IP，不含用户名或端口；同机其他用户可填 localhost；首次询问 |
+| `--ssh-user USER` | 同上 | 目标系统用户，回填时为 daemon 用户；不是 Multica profile；首次询问 |
+| `--ssh-port PORT` | 同上 | SSH 端口，1–65535；默认 22 |
+| `--ssh-key PATH` | 同上 | 发起 SSH 机器上的私钥路径，等价于 ssh -i；默认专用密钥，缺失则生成 |
 
-在 Multica 新开该 Agent 的聊天，只发一次：
+实例名、route、SSH alias 只允许字母、数字、点、下划线和连字符，长度 1–80，以字母或数字开头。Agent、Bot 名称包含空格时需在命令中加引号。多行命令需要行末 `\`，且后面不能有空格。
 
-> 请只回复 `GBB_RUNTIME_OK`。
+| 运行端设置 | 回传端设置 | 对应规则 |
+| --- | --- | --- |
+| `--instance-id host-alice` | `--route host-alice` | 默认路由和实例同名 |
+| `--instance-id host-alice --reply-route alice-reply` | `--route alice-reply --instance-id host-alice` | 路由对应路由，实例对应实例 |
+| `--bot bridge-host-alice` | `--bot bridge-host-alice` | 提示词标注一致；回填目标仍由 route 决定 |
+| 系统用户 alice 运行 daemon | 本机同用户，或 SSH 的 User alice | 必须读写运行端同一份 gbb 消息 |
 
-Grok 根据本轮 `next`，在 Mac 执行类似下列命令（使用生成提示词中的实际助手路径）：
+## 我们的部署示例
+
+工作区是“土卫五”，Linux 运行 Multica，Mac 登录 Grok Bot，已有 `bridge` webhook。运行端使用默认 Multica 登录配置，**不需要 `alex` 或 `alex_wan` profile**：
 
 ```bash
-"$HOME/.local/bin/gbb-multica-remote" answer linux-alice 本轮消息ID - <<'GBB_REPLY'
+# 运行端：实际 daemon 用户的普通终端；升级原测试 Agent
+bash install.sh runtime --instance-id linux-root --bot bridge --agent-name 'Grok Bot Bridge 测试'
+
+# 回传端：这个示例在 Mac；也可以是具备执行能力的 Linux 环境
+bash install.sh reply --route linux-root --ssh-alias multica-root --bot bridge
+```
+
+`multica-root` 是连接实际 daemon 用户的 SSH alias。这里仅保留场景和示例名，没有真实主机地址、工作区 UUID、邮箱、凭证或运行日志。不是 root 时请使用实际用户，不要复制 `/root` 路径或放宽权限。
+
+**两种职责都在同一台 Linux、同一用户时**，可直接：
+
+```bash
+bash install.sh runtime --instance-id host-alice --bot bridge
+bash install.sh reply --route host-alice --transport local --bot bridge
+```
+
+仍须让 Grok 能在这台机器执行回传助手。如果同机不同用户，则在 SSH 向导选择 `localhost` 和实际运行端用户名。
+
+## 多用户与多个 Bot
+
+不强制一人一个 Bot；独立使用时建议按用户/实例分别命名 Bot 和 webhook，例如 `bridge-host-alice`、`bridge-host-bob`，便于查看和维护。共用 Bot 时必须按请求的 `reply_route` 回填，不能根据显示名称猜测用户。
+
+每个 Linux 系统用户一套 gbb 实例、daemon 和数据目录，可各自使用 Multica 的默认 profile，也可以选已有命名 profile。安装器匹配 runtime profile ID、当前 daemon ID 和 online 状态，Agent 则保存对应的实例、路由、GBB_HOME。回传端可以保存多条路由，添加时会保留其他路由。
+
+命名 profile 或 Bot 名称不提供系统隔离。此安装器按**每个 Linux 用户一个实例**设计；同用户切换实例时会停止提示核对。需要账号隔离时使用独立系统用户、容器或 VM。共用 Bot/执行环境也会共享一部分访问能力。
+
+## 检查、升级与手动回填
+
+```bash
+bash install.sh runtime --check
+bash install.sh reply --route host-alice --check
+bash install.sh ssh --ssh-alias multica-alice --check
+bash install.sh runtime --dry-run
+bash install.sh reply --dry-run
+bash install.sh ssh --dry-run
+"$HOME/.local/bin/gbb-multica-remote" check host-alice
+"$HOME/.local/bin/gbb-multica-remote" inbox host-alice
+```
+
+升级时 `git pull` 后重跑安装向导或原命令。已有资源复用，变更的配置文件先备份；不会自动发测试消息。`runtime --check` 返回 2 表示 Multica 配置尚需修正，其他非零状态表示检查/权限/连接失败。
+
+先手动验证也可以：在运行端同一用户、同一 GBB_HOME 下查询 inbox，并对**本轮新消息**回填：
+
+```bash
+"$HOME/.local/share/gbb-multica/npm/bin/gbb" inbox
+"$HOME/.local/share/gbb-multica/npm/bin/gbb" answer 本轮消息ID - <<'GBB_REPLY'
 GBB_RUNTIME_OK
 GBB_REPLY
 ```
 
-Multica 显示回答、运行成功结束，才代表完整打通。仅 `--check` 成功不能证明 Bot 电脑执行能力已经可用。之后可发送“列出当前工作区项目”；创建/编辑操作应明确描述目标及字段，由服务器包装使用该任务的身份执行。
-
-## 我们的实际场景示例
-
-工作区是“土卫五”，一台 Linux 服务器运行 Multica daemon，Mac 登录 Grok Bot，已有 Bridge webhook。服务器账号使用默认 Multica 登录配置，**不需要 `alex` 或 `alex_wan` profile**。可以选择实例名 `linux-root`：
-
-```bash
-# 服务器 root 的普通终端；已有 bridge 凭证可直接复用
-bash install.sh server --instance-id linux-root --bot bridge \
-  --agent-name 'Grok Bot Bridge 测试'
-
-# Mac；multica-root 是你自己配置好的 SSH alias，User 为 root
-bash install.sh mac --route linux-root --ssh-alias multica-root --bot bridge
-```
-
-这里只公开场景及可替换名称，没有真实服务器地址、工作区 UUID、用户邮箱、访问凭证或运行日志。服务器不是 root 时，使用实际 daemon 用户，不要复制 `/root/.grok-bot-bridge` 路径或放宽 `/root` 权限。
-
-同一服务器再增加 alice、bob 时，各自使用独立 Linux 登录和 daemon，并分别运行 server 安装；Mac 分别添加 `linux-alice → multica-alice`、`linux-bob → multica-bob` 两条 route。可以共用 `bridge` Bot，也可分别使用 `bridge-linux-alice`、`bridge-linux-bob`；脚本会合并保留已有路由。
-
-## 检测、升级及手动回填
-
-```bash
-# 两种模式都支持纯展示：不写文件、不连接网络
-bash install.sh server --dry-run
-bash install.sh mac --dry-run
-
-# 已安装后只读检查
-bash install.sh server --check
-bash install.sh mac --route linux-alice --check
-"$HOME/.local/bin/gbb-multica-remote" check linux-alice
-"$HOME/.local/bin/gbb-multica-remote" inbox linux-alice
-```
-
-升级时拉取代码后重跑原安装命令。修改过的本地文件会先备份，已有资源会复用，不会自动发送测试消息。`--check` 返回 2 表示 Multica 配置尚需修正，其他非零状态说明检查/权限/连接失败。
-
-先手动验证也可以：在服务器同一用户及同一 GBB_HOME 下运行 `gbb inbox`，将 Grok 的真实回答用 `gbb answer 本轮消息ID -` 回填。此时无需 Mac→SSH 自动回填。固定安装的 gbb 位于 `~/.local/share/gbb-multica/npm/bin/gbb`；可直接用绝对路径。默认整次任务等待 900 秒，最多 8 次 Grok 请求；旧任务超时后补写答案不会重新启动它。
-
-更多工具能力、回填 JSON、权限边界见 [工具协议与操作说明](docs/tool-protocol.md)。
+使用自定义 GBB_HOME 时需在这个终端先设置为安装时的值。工具能力、回填 JSON 和权限边界见 [工具协议](docs/tool-protocol.md)。
 
 ## 目录与版本来源
 
 | 路径 | 内容 |
 | --- | --- |
-| `install.sh` / `install.py` | Linux / macOS 安装入口 |
-| `ssh_setup.py` | Mac 专用密钥生成、公钥追加及免密验证 |
+| `install.sh` / `install.py` | 交互菜单与命令行安装入口 |
+| `ssh_setup.py` | 通用 SSH 专用密钥、公钥追加及免密验证 |
 | `gbb-multica-agent` | Copilot JSONL 协议的 Multica runtime 包装 |
-| `gbb-multica-setup.sh` | 可独立运行的 runtime/Agent 注册脚本，内嵌同版本包装 |
-| `gbb-multica-endpoint` | 服务器固定的 check/inbox/answer 入口 |
-| `gbb-multica-remote` | Mac 路由与 SSH 回填助手 |
-| `vendor/` | 固定 gbb 0.2.0 安装包、校验值和上游许可证 |
+| `gbb-multica-setup.sh` | 独立 runtime/Agent 注册脚本，内嵌同版本包装 |
+| `gbb-multica-endpoint` | 运行端固定 check/inbox/answer 入口 |
+| `gbb-multica-remote` | 回传路由助手，支持本机或 SSH |
+| `vendor/` | gbb 0.2.0 归档、校验值及上游许可证 |
 
-gbb 0.2.0 安装包是从本机已安装、通过联调的程序执行 `npm pack --ignore-scripts` 取得，**不声称是 npm 官方 0.2.0 发布归档**。它含编译后的 JS、示例和文档，没有运行时 npm 依赖，也不含本机配置、凭证或消息。上游为 [anup-a/grok-bot-bridge](https://github.com/anup-a/grok-bot-bridge)，按 MIT 许可证保留归属。
+gbb 0.2.0 归档来自本机已安装、通过联调的程序执行 `npm pack --ignore-scripts`，**不声称是 npm 官方 0.2.0 发布归档**。包含编译 JS、示例和文档，无运行时 npm 依赖，无本机配置、凭证或消息。上游为 [anup-a/grok-bot-bridge](https://github.com/anup-a/grok-bot-bridge)，按 MIT 保留归属。
 
 ## 验证
 
-在 Linux、Node.js 20+、Python 3.9+ 环境运行：
+在 Linux、Node.js 20+、Python 3.9+ 环境执行：
 
 ```bash
 python3 test_gbb_multica_compat.py
@@ -284,10 +303,10 @@ python3 test_gbb_multica_agent.py
 python3 test_gbb_multica_setup.py
 python3 test_gbb_multica_install.py
 python3 test_ssh_setup.py
-# 下列工具测试还需要已安装的 Multica CLI，用于实际 --help 参数契约；业务读写为隔离模拟
+# 工具测试还需要 Multica CLI，用于真实 --help 参数契约；业务读写为隔离模拟
 python3 -m unittest -v test_gbb_multica_tools.py
 ```
 
-测试使用环回 webhook、临时 gbb 目录、模拟 Multica API 和 SSH；不发生产 Grok 请求、不改业务资源。Mac 安装及路由逻辑通过模拟 Darwin/SSH 覆盖；实际 Mac 客户端授权和真实 SSH 环境仍需部署后完成第 5 步验收。
+测试使用临时数据、环回 webhook、模拟 Multica API 和 SSH，不发生产 Grok 请求。安装测试覆盖离线 npm、命令别名、交互菜单/确认/取消、本机回填、独立 SSH 连接复用和实例校验；通过真实 PTY 检查无参数菜单能在终端显示。
 
-SSH 测试另外验证公钥追加、去重、既有配置保留、权限、失败不重试和专用配置传递。环境具备 root、sshd 及 `/run/sshd` 时，会启动仅监听环回地址的临时 sshd，用临时初始密钥代替密码完成真实公钥复制及后续新密钥登录；不会修改宿主机账号的 authorized_keys。该测试不代表已在真实 Mac 上输入密码验收。
+SSH 测试覆盖追加、去重、配置保留、权限、失败不重试及专用配置传递。具备 root、sshd 和 `/run/sshd` 时会启动仅监听环回地址的临时 sshd，以临时初始密钥代替密码验证真实公钥复制和后续登录；不修改宿主账号 authorized_keys。真实 Bot 执行授权、Mac 客户端和密码输入仍需部署后完成完整问答验收。
