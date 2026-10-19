@@ -103,7 +103,8 @@ def configure_credentials(node, gbb, home, bot):
         print(f'复用已有 {bot} webhook 凭证（未发送请求）。')
         return
     require(sys.stdin.isatty(), '缺少 webhook 配置。请在交互终端重跑并输入 URL/key。')
-    show_prompt((ROOT / 'docs/grok-bot-prompt.md').read_text(), f'为 {bot} 配置 webhook 的初始模板')
+    template = (ROOT / 'docs/grok-bot-prompt.md').read_text().replace('{{BOT_NAME}}', json.dumps(bot, ensure_ascii=False))
+    show_prompt(template, f'为 {bot} 配置 webhook 的初始模板')
     print('已有 routine 可复用原 URL/key；模板中的助手路径和路由将在回传端配置后自动填好并显示，请再复制更新到 Bot。')
     url = input('Webhook URL: ').strip()
     parsed = urlsplit(url)
@@ -205,12 +206,13 @@ def runtime(args, config_root, bin_dir):
     return 0
 
 
-def prompt_for_routes(routes, helper):
+def prompt_for_routes(routes, helper, bot='Bridge'):
     catalog = []
     for name, item in sorted(routes.items()):
-        connection = '本机同用户' if item.get('transport') == 'local' else f'SSH `{item["ssh_alias"]}`'
-        catalog.append(f'- route `{name}` → {connection}，实例 `{item["instance_id"]}`，Bot `{item.get("bot", "bridge")}`')
+        connection = 'local (same machine and user)' if item.get('transport') == 'local' else f'SSH `{item["ssh_alias"]}`'
+        catalog.append(f'- route `{name}` -> {connection}; instance `{item["instance_id"]}`; Bot `{item.get("bot", "bridge")}`')
     return ((ROOT / 'docs/grok-bot-prompt.md').read_text()
+            .replace('{{BOT_NAME}}', json.dumps(bot, ensure_ascii=False))
             .replace('{{REMOTE_HELPER}}', str(helper))
             .replace('{{REMOTE_HELPER_COMMAND}}', shlex.quote(str(helper)))
             .replace('{{ROUTE_CATALOG}}', '\n'.join(catalog)))
@@ -309,7 +311,7 @@ def reply(args, config_root, bin_dir):
     routes[route_name] = item
     write_file(config_root / 'routes.json', json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     prompt = config_root / 'grok-bot-prompt.md'
-    content = prompt_for_routes(routes, helper)
+    content = prompt_for_routes(routes, helper, item['bot'])
     write_file(prompt, content)
     print(f'回传端配置完成。路由：{route_name} → {target}；未发送 Grok 请求。')
     print(f'完整提示词已保存：{prompt}')

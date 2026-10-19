@@ -58,6 +58,8 @@ bash install.sh local --check
 
 运行端首次需要 URL/key 时，会先在终端完整显示 [Bot 提示词模板](grok-bot-prompt.md)。直接复制标记之间的内容交给已有 Grok Bot，创建或更新 webhook routine，从面板取得 URL/key，再回终端填写。已有 Bot 和 routine 可复用；不必再创建。名称可用 `bridge-host-alice` 方便识别。两端安装后，脚本会再次显示自动填好路径和路由的完整提示词，复制它更新 Bot 的处理说明即可。
 
+提示词使用英文，沿用随附 gbb 0.2.0 原版的 Routing、Events、Rules 和本地 agent 使用说明；Bot 名称按 `--bot` 自动填入，routine 名称为 `Multica bridge`。接入部分仅补充 Multica 必需的回填助手、路由和工具协议说明。原版模板及 MIT 许可证保留在 `vendor/grok-bot-bridge-0.2.0.tgz` 中。
+
 ### 2. 配置运行端
 
 推荐菜单选择“运行端”。命令行等价示例：
