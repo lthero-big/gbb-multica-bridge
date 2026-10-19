@@ -18,3 +18,5 @@ multica-runs/
 *-live-probe.json
 id_ed25519*
 id_rsa*
+.ssh/
+gbb_multica_*_ed25519

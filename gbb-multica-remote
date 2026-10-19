@@ -12,6 +12,19 @@ import sys
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 
 
+def ssh_base(route):
+    alias = route.get('ssh_alias')
+    if not isinstance(alias, str) or not SAFE_NAME.fullmatch(alias):
+        raise ValueError('invalid ssh_alias')
+    command = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+    config = route.get('ssh_config')
+    if config is not None:
+        if not isinstance(config, str) or not config.startswith('/') or any(c in config for c in '\n\r\0'):
+            raise ValueError('invalid ssh_config path')
+        command += ['-F', config]
+    return [*command, '--', alias]
+
+
 def ssh_command(route, action, message_id=None):
     for field in ('ssh_alias', 'instance_id'):
         if not isinstance(route.get(field), str) or not SAFE_NAME.fullmatch(route[field]):
@@ -30,8 +43,7 @@ def ssh_command(route, action, message_id=None):
         if not message_id:
             raise ValueError('answer requires message ID')
         remote.append('-')
-    return ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-            '--', route['ssh_alias'], shlex.join(remote)]
+    return [*ssh_base(route), shlex.join(remote)]
 
 
 def main():

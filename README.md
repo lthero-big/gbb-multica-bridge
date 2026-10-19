@@ -36,7 +36,7 @@ flowchart LR
 
 - 服务器：Linux、Python 3.9+、Node.js 20+ 与 npm；已安装 Multica CLI，并以实际 daemon 用户登录目标工作区、启动 daemon。已验证 Multica CLI 0.6.3、Node 22.22.0。
 - Mac：Python 3.9+、系统 SSH 客户端、Grok Bot 客户端及电脑执行能力。Mac 不必安装 Multica 或本地 gbb。
-- SSH 已配置好用户、主机密钥校验及非交互登录；安装器使用 `BatchMode=yes`，不会替你修改服务器 `authorized_keys` 或关闭主机密钥校验。
+- SSH 可以使用已有免密 alias，也可以在 Mac 安装时加 `--setup-ssh`，通过一次密码登录追加公钥。首次配置要求目标账号允许密码认证，并使用 `~/.ssh/authorized_keys` 授权公钥；后续回填使用 `BatchMode=yes`。
 - GitHub 私有仓库读取权限。每台机器可用 `gh repo clone lthero-big/gbb-multica-bridge`，或用已配置凭证的 `git clone`。
 
 ## 安装参数说明
@@ -76,7 +76,12 @@ multica --profile alice workspace get --output json
 | 参数 | 用途与填写方式 | 不填时的行为 |
 | --- | --- | --- |
 | `--route linux-alice` | Mac 上这条 SSH 回填路径的名称，必须与服务器的 `--reply-route` 相同；服务器未显式设置 reply-route 时，就是其 instance-id。 | 也可用 `--instance-id` 提供同名路由；两者均未传时交互询问，非交互模式报错。 |
-| `--ssh-alias multica-alice` | Mac `~/.ssh/config` 中已经配置好的 **Host 别名**。例如配置里写 `Host multica-alice`，这里就填 `multica-alice`；对应的 `User` 必须是服务器实际运行 daemon 的系统用户。安装器不会自动创建 SSH alias。 | 重用这条路由上次的 SSH alias；新路由会交互询问。 |
+| `--ssh-alias multica-alice` | 要使用的 **Host 别名**。普通模式使用 Mac `~/.ssh/config` 中已有的别名；加 `--setup-ssh` 时自动配置专用别名。对应的 `User` 必须是服务器实际运行 daemon 的系统用户。 | 重用这条路由上次的 alias；普通新路由会询问；setup-ssh 模式默认 `multica-路由名`。 |
+| `--setup-ssh` | 首次安装时自动生成/复用密钥，通过一次密码登录向目标账号追加公钥，验证免密后继续配置回填路由。 | 使用已有 SSH alias，不修改公钥配置。不能与只读 `--check` 同用。 |
+| `--ssh-host your-server.example` | setup-ssh 模式的服务器域名/IP，只填地址，不含用户名、协议或端口。 | 复用这条路由上次的服务器地址；首次交互询问。 |
+| `--ssh-user alice` | setup-ssh 模式的服务器系统用户，必须与 daemon 用户一致；不是 Multica profile。 | 复用上次用户；首次交互询问。 |
+| `--ssh-port 22` | setup-ssh 模式的 SSH 端口，范围 1–65535。例如服务器端口为 2222，就填 `--ssh-port 2222`。 | 复用上次端口；首次为 22。 |
+| `--ssh-key "$HOME/.ssh/id_ed25519"` | setup-ssh 模式使用的 **Mac 私钥**路径，相当于 `ssh -i` 选择的身份。已有文件会复用；不存在时生成 Ed25519 密钥对。 | 复用上次私钥路径；首次为 `~/.ssh/gbb_multica_别名_ed25519`。私钥留在 Mac，只复制公钥。 |
 | `--bot bridge-linux-alice` | 生成 Bot 提示词时使用的名称标注。建议与服务器 `--bot` 保持一致；它不负责选择 SSH 账号或校验 webhook。 | 重用这条路由上次的名称；首次为 `bridge-实例名`。已有 Bot 叫 `bridge` 时请显式传 `--bot bridge`。 |
 | `--instance-id linux-alice` | 服务器的真实部署标识，用于检查是否连接了正确实例。仅在 route 名与服务器实例名不同等情况下需要单独填写。 | 重用这条路由上次的实例名；首次与 `--route` 相同。 |
 | `--endpoint /home/alice/.local/bin/gbb-multica-endpoint` | SSH 登录服务器后要执行的回填入口的**服务器绝对路径**。不要填 Mac 路径。 | 重用上次路径；新路由通过 SSH 自动发现远端 `~/.local/bin/gbb-multica-endpoint`，通常不用填。 |
@@ -90,6 +95,8 @@ Host multica-alice
 ```
 
 那么 `--ssh-alias` 填 `multica-alice`；`alice` 是 SSH 登录的系统用户。它恰好与某个 Multica profile 同名也只是命名选择，两者独立。完整 SSH 密钥示例见后面的快速开始。
+
+`--ssh-host`、`--ssh-user`、`--ssh-port`、`--ssh-key` 仅用于 Mac 的 `--setup-ssh` 模式。专用配置保存在 Mac 的 `~/.ssh/gbb-multica/别名.conf`，回填助手自动带 `ssh -F` 使用它；原有 `~/.ssh/config` 会保留。
 
 ### 两端怎样对应
 
@@ -145,7 +152,40 @@ bash install.sh server \
 
 ### 4. Mac 一键配置回填
 
-例如 `~/.ssh/config` 已有如下别名，先自行确认 `ssh multica-alice` 能登录：
+**首次配置 SSH：推荐使用自动引导。** 在 Mac 的交互终端运行：
+
+```bash
+bash install.sh mac --route linux-alice --bot bridge-linux-alice --setup-ssh
+```
+
+按提示填写服务器域名/IP、运行 daemon 的系统用户名；SSH alias 可接受默认值。第一次连接时 SSH 可能要求确认主机指纹，核对后继续；随后输入一次服务器密码。密码由 SSH 自己读取，不进入脚本变量、命令参数或配置文件。
+
+如果已经知道连接信息，可以直接填写（将示例地址和用户换成实际值）：
+
+```bash
+bash install.sh mac \
+  --route linux-alice \
+  --bot bridge-linux-alice \
+  --setup-ssh \
+  --ssh-host your-server.example \
+  --ssh-user alice \
+  --ssh-port 22 \
+  --ssh-alias multica-alice
+```
+
+流程为：生成/复用 Mac 专用密钥 → 用 `ssh -i` 指定该密钥尝试连接 → 必要时只请求一次服务器密码并追加公钥 → 验证免密登录 → 配置回填路由。它保留服务器其他 `authorized_keys` 条目，按公钥内容去重；重复安装且免密已可用时不再请求密码。
+
+默认新建的是无口令专用 Ed25519 私钥，权限为 600，供 Bot 无人值守回填；私钥只留在 Mac。若指定已有加密私钥，请先将其加载到 `ssh-agent`，以便后续 `BatchMode=yes` 的连接能使用它；安装时从私钥核对公钥还可能要求输入这把私钥的解密口令，与服务器登录密码分开。脚本不会修改服务器的密码认证策略；服务器禁止密码登录、仅支持交互式 MFA 或使用其他公钥授权路径时，先自行配置免密 alias，再使用下方的已有连接方式。
+
+脚本使用专用配置 `~/.ssh/gbb-multica/multica-alice.conf`（文件名随 alias 变化）。回填助手会自动使用它；手工连接可执行：
+
+```bash
+ssh -F "$HOME/.ssh/gbb-multica/multica-alice.conf" multica-alice
+```
+
+这些身份和配置选项使用系统 OpenSSH，参见 [ssh 的 -i/-F 参数](https://man.openbsd.org/ssh.1) 与 [SSH 配置说明](https://man.openbsd.org/ssh_config.5)。
+
+**已有免密 SSH alias：继续直接复用。** 例如 `~/.ssh/config` 已有如下别名，先自行确认 `ssh multica-alice` 能登录：
 
 ```sshconfig
 Host multica-alice
@@ -225,6 +265,7 @@ bash install.sh mac --route linux-alice --check
 | 路径 | 内容 |
 | --- | --- |
 | `install.sh` / `install.py` | Linux / macOS 安装入口 |
+| `ssh_setup.py` | Mac 专用密钥生成、公钥追加及免密验证 |
 | `gbb-multica-agent` | Copilot JSONL 协议的 Multica runtime 包装 |
 | `gbb-multica-setup.sh` | 可独立运行的 runtime/Agent 注册脚本，内嵌同版本包装 |
 | `gbb-multica-endpoint` | 服务器固定的 check/inbox/answer 入口 |
@@ -242,8 +283,11 @@ python3 test_gbb_multica_compat.py
 python3 test_gbb_multica_agent.py
 python3 test_gbb_multica_setup.py
 python3 test_gbb_multica_install.py
+python3 test_ssh_setup.py
 # 下列工具测试还需要已安装的 Multica CLI，用于实际 --help 参数契约；业务读写为隔离模拟
 python3 -m unittest -v test_gbb_multica_tools.py
 ```
 
 测试使用环回 webhook、临时 gbb 目录、模拟 Multica API 和 SSH；不发生产 Grok 请求、不改业务资源。Mac 安装及路由逻辑通过模拟 Darwin/SSH 覆盖；实际 Mac 客户端授权和真实 SSH 环境仍需部署后完成第 5 步验收。
+
+SSH 测试另外验证公钥追加、去重、既有配置保留、权限、失败不重试和专用配置传递。环境具备 root、sshd 及 `/run/sshd` 时，会启动仅监听环回地址的临时 sshd，用临时初始密钥代替密码完成真实公钥复制及后续新密钥登录；不会修改宿主机账号的 authorized_keys。该测试不代表已在真实 Mac 上输入密码验收。

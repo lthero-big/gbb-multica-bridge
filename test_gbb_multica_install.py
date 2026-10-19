@@ -157,6 +157,34 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         with self.assertRaises(ValueError):
             REMOTE['ssh_command'](route, 'answer', '../../config')
 
+    def test_mac_bootstrap_config_is_saved_and_used_for_all_ssh(self):
+        config_root = self.mac_home / 'bootstrap-config'
+        bin_dir = self.mac_home / 'bootstrap-bin'
+        managed = str(self.mac_home / '.ssh/gbb-multica/server-alice.conf')
+        setup_result = {'ssh_config': managed, 'ssh_connection': {
+            'host': 'server.example', 'user': 'alice', 'port': 2222, 'key_path': '/tmp/fake-identity'}}
+        environment = dict(self.env, HOME=str(self.mac_home), FAKE_SSH_MAP=str(self.ssh_map), FAKE_SSH_LOG=str(self.ssh_log))
+        args = argparse.Namespace(route='bootstrapped-alice', instance_id='alice', ssh_alias='server-alice',
+                                  endpoint=None, bot='bridge-alice', check=False, setup_ssh=True,
+                                  ssh_host='server.example', ssh_user='alice', ssh_port=2222, ssh_key='/tmp/fake-identity')
+        calls = []
+        original_run = INSTALL['run']
+        def run(arguments, **kwargs):
+            calls.append(arguments)
+            return original_run(arguments, **kwargs)
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(INSTALL['platform'], 'system', return_value='Darwin'), \
+                patch('ssh_setup.setup_ssh', return_value=setup_result) as bootstrap, \
+                patch.dict(INSTALL['mac'].__globals__, run=run):
+            INSTALL['mac'](args, config_root, bin_dir)
+            bootstrap.assert_called_once()
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call[call.index('-F') + 1], managed)
+        route = json.loads((config_root / 'routes.json').read_text())['routes']['bootstrapped-alice']
+        self.assertEqual(route['ssh_config'], managed)
+        self.assertEqual(route['ssh_connection'], setup_result['ssh_connection'])
+
     def test_new_credentials_use_private_store_without_sending(self):
         home = self.root / 'fresh-gbb'
         home.mkdir(exist_ok=True, mode=0o700)

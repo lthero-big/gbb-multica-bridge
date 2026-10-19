@@ -206,18 +206,32 @@ def mac(args, config_root, bin_dir):
     config = read_config(config_root / 'routes.json')
     routes = config.setdefault('routes', {})
     previous = routes.get(route_name, {})
-    alias = safe_name(ask(args.ssh_alias, '已配置的 SSH Host 别名', previous.get('ssh_alias')))
+    bootstrap = getattr(args, 'setup_ssh', False)
+    require(not (bootstrap and args.check), '--setup-ssh 会修改密钥/公钥配置，不能与只读 --check 同用')
+    alias = safe_name(ask(args.ssh_alias, 'SSH Host 别名', previous.get('ssh_alias') or
+                          (('multica-' + route_name)[:80] if bootstrap else None)))
     instance = safe_name(args.instance_id or previous.get('instance_id') or route_name)
+    extra = {key: previous[key] for key in ('ssh_config', 'ssh_connection')
+             if key in previous and alias == previous.get('ssh_alias')}
+    if bootstrap:
+        from ssh_setup import setup_ssh
+        connection = previous.get('ssh_connection', {})
+        extra = setup_ssh(alias,
+            host=ask(args.ssh_host, '服务器域名或 IP', connection.get('host')),
+            user=ask(args.ssh_user, '服务器 daemon 的系统用户名', connection.get('user')),
+            port=args.ssh_port or connection.get('port', 22),
+            key_path=args.ssh_key or connection.get('key_path'), write_file=write_file)
+    router = runpy.run_path(str(ROOT / 'gbb-multica-remote'))
+    item = dict(ssh_alias=alias, instance_id=instance,
+                bot=args.bot or previous.get('bot') or 'bridge-' + instance, **extra)
     endpoint = args.endpoint or previous.get('endpoint')
     if not endpoint:
         # Fixed discovery command: no caller text interpolated into a remote shell.
-        discovered = run(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '--', alias,
+        discovered = run([*router['ssh_base'](item),
                           'test -x "$HOME/.local/bin/gbb-multica-endpoint" && printf "%s\\n" "$HOME/.local/bin/gbb-multica-endpoint"'],
                          capture_output=True, text=True)
         endpoint = discovered.stdout.strip()
-    item = dict(ssh_alias=alias, endpoint=endpoint, instance_id=instance,
-                bot=args.bot or previous.get('bot') or 'bridge-' + instance)
-    router = runpy.run_path(str(ROOT / 'gbb-multica-remote'))
+    item['endpoint'] = endpoint
     checked = run(router['ssh_command'](item, 'check'), capture_output=True, text=True)
     status = json.loads(checked.stdout)
     require(status.get('ok') is True and status.get('instance_id') == instance and status.get('gbb_version') == '0.2.0',
@@ -249,7 +263,8 @@ def main():
 --profile 只选择已存在的 Multica 登录配置，不创建配置，也不是 Linux 用户名。
 默认 Mac 的 --route 与服务器 --instance-id 相同。
 使用不同 --reply-route 时，Mac 还需传 --instance-id 服务器实例名。
-SSH alias 必须已在 Mac 配置好，并登录服务器实际的 daemon 用户。
+已有 SSH alias 可直接使用；加 --setup-ssh 可用一次密码登录配置公钥。
+示例：bash install.sh mac --route linux-alice --setup-ssh --ssh-host server.example --ssh-user alice
 全部参数及本机场景见 README.md 的“安装参数说明”。''')
     parser.add_argument('mode', choices=('server', 'mac'),
                         help='server：在 Linux daemon 用户终端安装；mac：在 Grok Bot 所在 Mac 配置回填')
@@ -275,15 +290,36 @@ SSH alias 必须已在 Mac 配置好，并登录服务器实际的 daemon 用户
     mac_options.add_argument('--route', metavar='ROUTE',
                              help='要添加/检查的回填路由；须与 server 的 reply-route 相同，未传时交互询问')
     mac_options.add_argument('--ssh-alias', metavar='HOST',
-                             help='Mac ~/.ssh/config 中已有的 Host 别名，例如 multica-alice；不是 Multica profile')
+                             help='已有 SSH Host 别名；--setup-ssh 时可自动生成专用别名，默认 multica-路由名')
+    mac_options.add_argument('--setup-ssh', action='store_true',
+                             help='生成/复用专用密钥，用一次密码登录追加公钥并验证免密；仅 Mac 安装模式')
+    mac_options.add_argument('--ssh-host', metavar='HOST',
+                             help='--setup-ssh 的服务器域名/IP；未填时询问，不能包含用户名或端口')
+    mac_options.add_argument('--ssh-user', metavar='USER',
+                             help='--setup-ssh 的服务器系统用户，必须与 daemon 用户一致；未填时询问')
+    mac_options.add_argument('--ssh-port', metavar='PORT', type=int,
+                             help='--setup-ssh 的 SSH 端口；默认 22，可复用上次设置')
+    mac_options.add_argument('--ssh-key', metavar='PATH',
+                             help='--setup-ssh 使用的 Mac 私钥路径；默认 ~/.ssh/gbb_multica_别名_ed25519，缺失时生成')
     mac_options.add_argument('--endpoint', metavar='PATH',
                              help='服务器 endpoint 的绝对路径；默认通过 SSH 发现 ~/.local/bin/gbb-multica-endpoint')
     args = parser.parse_args()
+    ssh_options = args.setup_ssh or any(value is not None for value in
+                                      (args.ssh_host, args.ssh_user, args.ssh_port, args.ssh_key))
+    if ssh_options and args.mode != 'mac':
+        parser.error('SSH 密钥引导参数仅适用于 mac 模式')
+    if ssh_options and not args.setup_ssh:
+        parser.error('--ssh-host/user/port/key 需与 --setup-ssh 一起使用')
+    if args.setup_ssh and args.check:
+        parser.error('--setup-ssh 不能与只读 --check 同用；配置完成后可单独运行 --check')
+    if args.ssh_port is not None and not 1 <= args.ssh_port <= 65535:
+        parser.error('--ssh-port 必须为 1–65535')
     require(sys.version_info >= (3, 9), '需要 Python 3.9+')
     if args.dry_run:
         print('server: 校验本地 gbb 0.2.0 包 → 用户目录安装 → 配置已有 Bot → 检查 daemon → 注册 runtime/Agent → SSH endpoint'
               if args.mode == 'server' else
-              'mac: 使用已有 SSH alias → 核对远端实例 → 安装回填助手 → 合并路由 → 生成 Bot 提示词')
+              ('mac: 生成/复用密钥 → 一次密码登录追加公钥 → 验证免密 → 配置回填路由' if args.setup_ssh else
+               'mac: 使用已有 SSH alias → 核对远端实例 → 安装回填助手 → 合并路由 → 生成 Bot 提示词'))
         return 0
     os.umask(0o077)
     config_root = Path(os.environ.get('GBB_MULTICA_CONFIG_HOME', str(Path.home() / '.config/gbb-multica'))).expanduser()
