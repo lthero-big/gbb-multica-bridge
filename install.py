@@ -238,13 +238,46 @@ def mac(args, config_root, bin_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('mode', choices=('server', 'mac'))
-    parser.add_argument('--check', action='store_true', help='只读检查已配置的部署，不发送 Grok 请求')
-    parser.add_argument('--dry-run', action='store_true', help='仅显示步骤；不连接服务器、不写文件')
-    for name in ('instance-id', 'reply-route', 'route', 'bot', 'profile', 'workspace-id',
-                 'agent-name', 'gbb-home', 'ssh-alias', 'endpoint'):
-        parser.add_argument('--' + name)
+    parser = argparse.ArgumentParser(
+        prog='bash install.sh', description='安装 Linux 服务器包装，或配置 Mac 的 SSH 回填助手。',
+        allow_abbrev=False, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''示例（在仓库目录中执行）：
+  服务器：bash install.sh server --instance-id linux-alice --bot bridge-linux-alice
+  Mac：   bash install.sh mac --route linux-alice --ssh-alias multica-alice --bot bridge-linux-alice
+
+首次默认使用 Multica 当前登录配置/工作区；重跑复用上次设置。
+--profile 只选择已存在的 Multica 登录配置，不创建配置，也不是 Linux 用户名。
+默认 Mac 的 --route 与服务器 --instance-id 相同。
+使用不同 --reply-route 时，Mac 还需传 --instance-id 服务器实例名。
+SSH alias 必须已在 Mac 配置好，并登录服务器实际的 daemon 用户。
+全部参数及本机场景见 README.md 的“安装参数说明”。''')
+    parser.add_argument('mode', choices=('server', 'mac'),
+                        help='server：在 Linux daemon 用户终端安装；mac：在 Grok Bot 所在 Mac 配置回填')
+    common = parser.add_argument_group('通用参数')
+    common.add_argument('--instance-id', metavar='INSTANCE',
+                        help='部署的稳定标识，例如 linux-alice；server 首次默认主机名-用户名；mac 默认使用 route')
+    common.add_argument('--bot', metavar='BOT',
+                        help='server：gbb 的 Bot 凭证名称/请求目标；首次默认 bridge-实例名；mac：提示词中的 Bot 名称标注')
+    common.add_argument('--check', action='store_true', help='只读检查已配置的部署，不发送 Grok 请求')
+    common.add_argument('--dry-run', action='store_true', help='仅显示步骤；不连接服务器、不写文件')
+    server_options = parser.add_argument_group('server 模式参数（重跑时优先复用已保存的设置）')
+    server_options.add_argument('--profile', metavar='PROFILE',
+                                help='已有的 Multica 登录配置名；首次省略使用 CLI 当前配置，不需要创建 alice')
+    server_options.add_argument('--workspace-id', metavar='UUID',
+                                help='目标工作区真实 UUID；首次省略读取当前工作区，可用 multica workspace get --output json 查询 id')
+    server_options.add_argument('--reply-route', metavar='ROUTE',
+                                help='Mac 回填路由名；首次默认与 instance-id 相同，须与 Mac 的 --route 对应')
+    server_options.add_argument('--agent-name', metavar='NAME',
+                                help='Multica 中创建/复用的 Agent 名称；首次默认 Grok Bot Bridge · 实例名；复用旧 Agent 请传原名')
+    server_options.add_argument('--gbb-home', metavar='DIR',
+                                help='此 daemon 用户的 gbb 配置、凭证和消息目录；首次默认 ~/.grok-bot-bridge')
+    mac_options = parser.add_argument_group('mac 模式参数')
+    mac_options.add_argument('--route', metavar='ROUTE',
+                             help='要添加/检查的回填路由；须与 server 的 reply-route 相同，未传时交互询问')
+    mac_options.add_argument('--ssh-alias', metavar='HOST',
+                             help='Mac ~/.ssh/config 中已有的 Host 别名，例如 multica-alice；不是 Multica profile')
+    mac_options.add_argument('--endpoint', metavar='PATH',
+                             help='服务器 endpoint 的绝对路径；默认通过 SSH 发现 ~/.local/bin/gbb-multica-endpoint')
     args = parser.parse_args()
     require(sys.version_info >= (3, 9), '需要 Python 3.9+')
     if args.dry_run:
