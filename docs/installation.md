@@ -56,7 +56,11 @@ bash install.sh local --check
 
 ### 1. 准备已有 Bot 的 webhook
 
-运行端首次需要 URL/key 时，会先在终端完整显示 [Bot 提示词模板](grok-bot-prompt.md)。直接复制标记之间的内容交给已有 Grok Bot，创建或更新 webhook routine，从面板取得 URL/key，再回终端填写。已有 Bot 和 routine 可复用；不必再创建。名称可用 `bridge-host-alice` 方便识别。两端安装后，脚本会再次显示自动填好路径和路由的完整提示词，复制它更新 Bot 的处理说明即可。
+运行端首次需要 URL/key 时，会先显示随附 gbb 0.2.0 的原版 `gbb prompt`，仅填入 Bot 名称、调整 routine 名称并补充已有 routine 的复用说明。这份创建提示词不含 `{{...}}` 占位符，也不需要尚未配置的回传路径或路由。直接复制终端标记之间的内容交给已有 Grok Bot，创建或更新 webhook routine。名称可用 `bridge-host-alice` 方便识别。
+
+和原版 gbb 一样，URL/key 需要从面板复制，不会自动发送到安装终端：在 Grok 聊天中点击 **Created routine** 卡片，打开面板底部 **Webhook**，点击 **POST to** 复制 URL、点击 **key** 复制密钥，再回终端分别填写。原版规则也要求不要把 URL/key 贴到聊天；密钥输入会隐藏。已有 Bot 和 routine 可复用，不必再创建。
+
+两端安装后，脚本才会将真实助手路径、路由填入[运行提示词模板](grok-bot-prompt.md)，完整显示并保存生成结果；复制它更新 Bot 的处理说明后再发起 Multica 测试。仓库里的模板含脚本替换用的占位符，终端显示给用户的创建提示词和最终运行提示词均不应含这些占位符。
 
 提示词使用英文，沿用随附 gbb 0.2.0 原版的 Routing、Events、Rules 和本地 agent 使用说明；Bot 名称按 `--bot` 自动填入，routine 名称为 `Multica bridge`。接入部分仅补充 Multica 必需的回填助手、路由和工具协议说明。原版模板及 MIT 许可证保留在 `vendor/grok-bot-bridge-0.2.0.tgz` 中。
 

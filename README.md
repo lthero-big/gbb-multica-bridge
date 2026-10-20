@@ -20,7 +20,7 @@ bash install.sh
 
 1. 准备已有 Grok Bot；首次填写凭证时，脚本会显示可复制的 webhook 配置模板。
 2. 同机同用户选择**本机部署（无需 SSH）**，一次配置运行端和回传端；跨机则分别配置这两端。
-3. 按提示输入 URL/key；配置完成后，复制终端显示的完整提示词交给 Bot，助手路径和路由已自动填好。
+3. 点击 Bot 的 **Created routine → Webhook**，从 **POST to / key** 复制 URL/key 填回终端；配置完成后，再复制终端显示的完整运行提示词交给 Bot，助手路径和路由已自动填好。
 4. 在 Multica 新聊天发送“请只回复 `GBB_RUNTIME_OK`”，确认回答正常返回。
 
 运行端支持 Linux / macOS，需要 Python 3.9+、Node.js 20+ / npm，以及已登录且 daemon 运行中的 Multica CLI；请在 daemon 用户的普通终端安装。Multica profile、工作区可使用当前配置。
@@ -51,7 +51,7 @@ bash install.sh local --instance-id host-alice --bot bridge
 ## 文档
 
 - [安装、参数与部署示例](docs/installation.md)：SSH、同机/跨机、多用户、升级和检查。
-- [Grok Bot 提示词](docs/grok-bot-prompt.md)：webhook 与回填说明。
+- [Grok Bot 运行提示词模板](docs/grok-bot-prompt.md)：由脚本填入配置后在终端显示。
 - [工具协议](docs/tool-protocol.md)：Multica 查询、创建、编辑及手动回填。
 - [gbb 0.2.0 来源与校验](vendor/README.md)：随附归档来自已验证的本机安装，不是 npm 官方发布归档。
 

@@ -164,6 +164,9 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
                 REMOTE['ssh_command'](dict(route, **changed), 'check')
         with self.assertRaises(ValueError):
             REMOTE['ssh_command'](route, 'answer', '../../config')
+        with patch.object(INSTALL['Path'], 'read_text', return_value='{{UNFILLED_FIELD}}'):
+            with self.assertRaisesRegex(ValueError, '占位符'):
+                INSTALL['prompt_for_routes']({}, '/home/alice/.local/bin/gbb-multica-remote')
 
     def test_mac_bootstrap_config_is_saved_and_used_for_all_ssh(self):
         config_root = self.mac_home / 'bootstrap-config'
@@ -422,11 +425,24 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         home = self.root / 'fresh-gbb'
         home.mkdir(exist_ok=True, mode=0o700)
         output = io.StringIO()
-        template = (ROOT / 'docs/grok-bot-prompt.md').read_text().replace('{{BOT_NAME}}', '"bridge-fresh"')
         def input_url(_):
-            # The full copyable template must be visible before asking for credentials.
-            self.assertIn(template.rstrip(), output.getvalue())
-            self.assertIn('Grok Bot 提示词结束', output.getvalue())
+            # Initial setup must use the original gbb prompt, with no unresolved reply config.
+            displayed = output.getvalue()
+            prompt = displayed.split('========== Grok Bot 提示词开始 ==========\n', 1)[1].split(
+                '\n========== Grok Bot 提示词结束 ==========', 1)[0]
+            self.assertIn('Please rename yourself to "bridge-fresh".', prompt)
+            self.assertIn('Name: Multica bridge', prompt)
+            self.assertIn('If it already exists, update it and reuse its webhook URL and key.', prompt)
+            self.assertIn("gbb answer <message_id> - <<'EOF'", prompt)
+            self.assertIn('Routing: if "to" names another Bot, you are the hub.', prompt)
+            self.assertIn('How to run local agents on my computer', prompt)
+            self.assertNotIn('{{', prompt)
+            self.assertNotIn('Configured Multica reply routes', prompt)
+            self.assertIn('Created routine', displayed)
+            self.assertIn('Webhook', displayed)
+            self.assertIn('POST to', displayed)
+            self.assertIn('key', displayed)
+            self.assertIn('还会显示填好路径和路由的运行提示词', displayed)
             return 'https://example.invalid/webhook'
         with patch.object(INSTALL['sys'].stdin, 'isatty', return_value=True), \
                 patch('builtins.input', side_effect=input_url), \

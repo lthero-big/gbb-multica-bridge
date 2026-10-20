@@ -103,9 +103,18 @@ def configure_credentials(node, gbb, home, bot):
         print(f'复用已有 {bot} webhook 凭证（未发送请求）。')
         return
     require(sys.stdin.isatty(), '缺少 webhook 配置。请在交互终端重跑并输入 URL/key。')
-    template = (ROOT / 'docs/grok-bot-prompt.md').read_text().replace('{{BOT_NAME}}', json.dumps(bot, ensure_ascii=False))
-    show_prompt(template, f'为 {bot} 配置 webhook 的初始模板')
-    print('已有 routine 可复用原 URL/key；模板中的助手路径和路由将在回传端配置后自动填好并显示，请再复制更新到 Bot。')
+    # Before the reply environment is configured, use gbb's original setup prompt.
+    template = run([gbb, 'prompt'], text=True, capture_output=True,
+                   env=dict(os.environ, GBB_HOME=str(home))).stdout
+    template = template.replace('Name: Local agent bridge', 'Name: Multica bridge').replace(
+        'Please create a routine on this Bot.',
+        'Please create a routine on this Bot. If it already exists, update it and reuse its webhook URL and key.')
+    template = f'You are my Bridge Bot. Please rename yourself to {json.dumps(bot, ensure_ascii=False)}.\n\n' + template
+    show_prompt(template, f'步骤 1：为 {bot} 创建或复用 webhook')
+    print('步骤 2：在 Grok Bot 聊天中点击 “Created routine” 卡片；打开面板底部的 “Webhook”。')
+    print('点击 “POST to” 复制 Webhook URL，点击 “key” 复制密钥，分别粘贴到下面的输入框。')
+    print('沿用原版规则：URL/key 不在聊天中发送，请从面板复制；已有 routine 可复用原 URL/key。')
+    print('以上是 webhook 创建提示词。回传端配置完成后，还会显示填好路径和路由的运行提示词，请再复制更新到 Bot。')
     url = input('Webhook URL: ').strip()
     parsed = urlsplit(url)
     require(parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password,
@@ -211,11 +220,13 @@ def prompt_for_routes(routes, helper, bot='Bridge'):
     for name, item in sorted(routes.items()):
         connection = 'local (same machine and user)' if item.get('transport') == 'local' else f'SSH `{item["ssh_alias"]}`'
         catalog.append(f'- route `{name}` -> {connection}; instance `{item["instance_id"]}`; Bot `{item.get("bot", "bridge")}`')
-    return ((ROOT / 'docs/grok-bot-prompt.md').read_text()
+    content = ((ROOT / 'docs/grok-bot-prompt.md').read_text()
             .replace('{{BOT_NAME}}', json.dumps(bot, ensure_ascii=False))
             .replace('{{REMOTE_HELPER}}', str(helper))
             .replace('{{REMOTE_HELPER_COMMAND}}', shlex.quote(str(helper)))
             .replace('{{ROUTE_CATALOG}}', '\n'.join(catalog)))
+    require(not re.search(r'\{\{[A-Z_]+\}\}', content), '运行提示词仍含未填入的占位符，停止生成；请检查模板')
+    return content
 
 
 def ssh_connection(args, config_root, alias, previous=None):
