@@ -508,7 +508,7 @@ def main():
            for value in (instance, route)):
         parser.error("GBB_INSTANCE_ID and GBB_REPLY_ROUTE must be safe names (1..80 characters)")
     try:
-        wait_seconds = int(os.environ.get("GBB_WAIT", "900"))
+        wait_seconds = int(os.environ.get("GBB_WAIT", "3600"))
         rounds = int(os.environ.get("GBB_MAX_ROUNDS", "8"))
         if wait_seconds <= 0 or not 1 <= rounds <= 32:
             raise ValueError

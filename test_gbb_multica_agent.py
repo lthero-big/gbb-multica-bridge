@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -16,9 +17,9 @@ def check():
     answer = 'GBB_RUNTIME_OK\n中文，多行；保留 "引号"、$HOME 和 `字面量`。'
     prompt = '运行时连通性测试\n' + ('长任务 "quotes" $HOME `literal`\n' * 2000)
     with tempfile.TemporaryDirectory(prefix="gbb-offline-") as tmp:
-        env = dict(os.environ, GBB_HOME=tmp, GBB_TARGET_BOT="bridge", GBB_WAIT="3",
+        env = dict(os.environ, GBB_HOME=tmp, GBB_TARGET_BOT="bridge",
                    GBB_INSTANCE_ID="linux-alice", GBB_REPLY_ROUTE="alice")
-        for key in ("GBB_WEBHOOK_URL", "GBB_WEBHOOK_KEY"):
+        for key in ("GBB_WEBHOOK_URL", "GBB_WEBHOOK_KEY", "GBB_WAIT"):
             env.pop(key, None)
         seen, mode = [], ["answer"]
         received = threading.Event()
@@ -75,6 +76,8 @@ def check():
             result = run("-p", prompt, "--output-format", "json", "--allow-all", "--no-ask-user")
             stream = events(result)
             assert result.returncode == 0, result.stderr
+            budget = re.search(r"waiting up to (\d+)s", result.stderr)
+            assert budget and 3500 <= int(budget.group(1)) <= 3600, "unset GBB_WAIT must provide a one-hour budget"
             request = json.loads(seen[0]["summary"].split("REQUEST_JSON:\n", 1)[1])
             assert request["user_task"] == prompt, "complete task must survive gbb's default truncation limit"
             assert seen[0]['bridge_instance'] == 'linux-alice' and seen[0]['reply_route'] == 'alice'

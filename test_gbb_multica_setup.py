@@ -123,7 +123,7 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             first=state()
             assert first["writes"].count("profile.create")==1 and first["writes"].count("agent.create")==1
             assert first["agents"][0]["runtime_id"]=="local-runtime", "must ignore the foreign runtime even when it appears first"
-            assert first["env"]=={"GBB_HOME":str(home),"GBB_TARGET_BOT":"bridge","GBB_WAIT":"900"}
+            assert first["env"]=={"GBB_HOME":str(home),"GBB_TARGET_BOT":"bridge","GBB_WAIT":"3600"}
             wrapper=install_dir/"gbb-multica-agent"
             assert os.access(wrapper,os.X_OK)
             version=subprocess.run([str(wrapper),"--version"],env=env,capture_output=True,text=True,check=True)
@@ -142,11 +142,12 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             collision = run('--instance-id', 'linux-bob')
             assert collision.returncode == 1 and '其他部署实例' in collision.stderr
 
-            reset(profiles=[profile.copy()],agents=[agent.copy()],env={"GBB_HOME":"/wrong-machine","EXISTING_SECRET":"KEEP_FAKE_SECRET"})
+            reset(profiles=[profile.copy()],agents=[agent.copy()],env={"GBB_HOME":"/wrong-machine","GBB_WAIT":"900","EXISTING_SECRET":"KEEP_FAKE_SECRET"})
             passed(run())
             fixed=state()
             assert fixed["agents"][0]["runtime_id"]=="local-runtime" and fixed["agents"][0]["model"]==""
             assert fixed["env"]["EXISTING_SECRET"]=="KEEP_FAKE_SECRET" and fixed["env"]["GBB_HOME"]==str(home)
+            assert fixed["env"]["GBB_WAIT"]=="3600", "upgrade the previous 15-minute budget"
             assert fixed["writes"].count("agent.update")==1 and fixed["writes"].count("env.set")==1
             assert not any("KEEP_FAKE_SECRET" in arg for call in fixed["calls"] for arg in call)
 

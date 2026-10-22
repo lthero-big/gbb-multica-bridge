@@ -528,7 +528,7 @@ def main():
            for value in (instance, route)):
         parser.error("GBB_INSTANCE_ID and GBB_REPLY_ROUTE must be safe names (1..80 characters)")
     try:
-        wait_seconds = int(os.environ.get("GBB_WAIT", "900"))
+        wait_seconds = int(os.environ.get("GBB_WAIT", "3600"))
         rounds = int(os.environ.get("GBB_MAX_ROUNDS", "8"))
         if wait_seconds <= 0 or not 1 <= rounds <= 32:
             raise ValueError
@@ -669,7 +669,7 @@ def main():
     parser.add_argument("--target-bot", help="默认使用已有 gbb hubBot/defaultBot")
     parser.add_argument("--agent-name", default="Grok Bot Bridge 测试")
     parser.add_argument("--bin-dir", help="包装安装目录；root 默认 /usr/local/bin")
-    parser.add_argument("--wait", type=int, default=900, help="整次任务总等待秒数，默认 900")
+    parser.add_argument("--wait", type=int, default=3600, help="整次任务总等待秒数，默认 3600（1 小时）")
     opts = parser.parse_args()
     for value in (opts.instance_id, opts.reply_route):
         require(value is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value), "实例/路由名称只能使用字母、数字、点、下划线或连字符，长度 1–80。")
