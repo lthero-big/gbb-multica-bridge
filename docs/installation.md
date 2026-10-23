@@ -15,7 +15,7 @@
 | `reply` 回传端 | 安装回填助手、维护路由、生成 Bot 提示词 | Linux 或 macOS；Python 3.9+；SSH 路由另需 OpenSSH；Grok 能调用这个环境 |
 | `ssh` 连接配置 | 单独生成/复用密钥、追加公钥、检查免密连接 | Linux 或 macOS；Python 3.9+、OpenSSH；不需要 Multica、gbb 或 endpoint |
 
-运行端安装必须在 **daemon 用户已登录 Multica 的普通终端**执行，不能借用聊天任务注入的 `mat_` token。已验证 Multica CLI 0.6.3、Node 22.22.0。回传端无需 Multica 登录凭证；SSH 回传端也不需要本地 gbb。
+运行端安装必须在 **daemon 用户已登录 Multica 的普通终端**执行，不能借用聊天任务注入的 `mat_` token。已验证 Multica CLI 0.6.3、0.6.5，Node 22.22.0；Multica 输出格式的兼容方式见下文“Multica CLI 兼容性”。回传端无需 Multica 登录凭证；SSH 回传端也不需要本地 gbb。
 
 旧命令 `server` 是 `runtime` 的兼容别名，`mac` 是 `reply` 的兼容别名；原命令和已有路由可继续使用。为兼容已安装的 endpoint，运行端配置文件仍叫 `server.json`，无需手动迁移。
 
@@ -266,6 +266,20 @@ GBB_REPLY
 
 使用自定义 GBB_HOME 时需在这个终端先设置为安装时的值。工具能力、回填 JSON 和权限边界见 [工具协议](tool-protocol.md)。
 
+## Multica CLI 兼容性
+
+已验证 Multica CLI **0.6.3** 和 **0.6.5**。Multica 升级频繁且会调整 `--output json` 的外层结构（例如 `agent env get` 在 0.6.3 返回扁平 `{"KEY":"value"}`，0.6.5 改为 `{"agent_id":…,"custom_env":{…}}`），因此本项目不按版本号判断，而是：
+
+- **统一宽容解析**：`gbb-multica-agent` 内的 “Multica CLI JSON normalizers” 段落是唯一实现，`gbb-multica-setup.sh` 内嵌同一份代码，`install.py` 直接加载它（测试会校验内嵌副本与独立文件一致）。每类命令一个解析函数：
+  - `agent env get`：扁平映射、`{custom_env:{}}`、`{env:{}}`、`{data:{…}}` 以及 `[{key,value}]` 列表；
+  - `agent` / `runtime` / `runtime profile` / `workspace` 的 get、list、create、update：裸对象、数组，或 `{data|items|results|nodes|edges|agents|runtimes|profiles…: …}` 等外层包装；
+  - `daemon status`：`status`/`state`、`pid`、`daemon_id`/`id`，工作区可为字符串或对象。
+- **遇到无法识别的结构直接停止**：错误会写明具体命令及返回 JSON 的顶层键名（不输出任何值），不会在猜测的基础上修改配置。
+- **能力检测**：通过 `multica <命令> --help` 判断是否支持 `--output`、`--custom-env-stdin`；后者不可用时改用权限 0600 的临时 `--custom-env-file`，环境变量绝不出现在命令行参数中。
+- **回读校验**只比较脚本自己写入的键（`GBB_HOME`、`GBB_TARGET_BOT`、`GBB_WAIT` 及可选的 `GBB_INSTANCE_ID`、`GBB_REPLY_ROUTE`）的规范化值，不一致时只列出键名；其他已有条目原样保留。
+
+升级 Multica 后先执行 `bash install.sh runtime --check`；若提示 “unexpected JSON from `multica …`”，请附带该行提交 issue。
+
 ## 目录与版本来源
 
 | 路径 | 内容 |
@@ -292,6 +306,8 @@ python3 test_ssh_setup.py
 # 工具测试还需要 Multica CLI，用于真实 --help 参数契约；业务读写为隔离模拟
 python3 -m unittest -v test_gbb_multica_tools.py
 ```
+
+`test_gbb_multica_setup.py` 和 `test_gbb_multica_install.py` 以模拟 CLI 分别输出 0.6.3 扁平结构、0.6.5 `custom_env` 结构和带 `data`/`items` 外层包装的未来结构，并验证未知结构会带命令名和顶层键名报错。
 
 测试使用临时数据、环回 webhook、模拟 Multica API 和 SSH，不发生产 Grok 请求。安装测试覆盖离线 npm、命令别名、交互菜单/确认/取消、本机回填、独立 SSH 连接复用和实例校验；通过真实 PTY 检查无参数菜单能在终端显示。
 

@@ -49,6 +49,8 @@ bash install.sh local --instance-id host-alice --bot bridge
 
 `host-alice` 是自定义实例/路由标识，`bridge` 是已有 Bot 的凭证名称。更新时 `git pull` 后重跑安装向导；旧 `server` / `mac` 命令兼容保留。
 
+已验证 Multica CLI 0.6.3、0.6.5。Multica 的 JSON 输出结构经统一的宽容解析处理，并通过 `--help` 检测参数能力而非固定版本；遇到无法识别的新结构会报出命令名和顶层键名后停止，详见[Multica CLI 兼容性](docs/installation.md#multica-cli-兼容性)。
+
 ## 文档
 
 - [安装、参数与部署示例](docs/installation.md)：SSH、同机/跨机、多用户、升级和检查。

@@ -148,6 +148,135 @@ class BridgeError(Exception):
         self.code = code
 
 
+# --- Multica CLI JSON normalizers (single source; gbb-multica-setup.sh embeds this file
+# and install.py loads it). Multica changes JSON envelopes between releases: 0.6.3 printed
+# `agent env get` as a flat map, 0.6.5 wraps it as {"agent_id", "custom_env": {...}}.
+# Every caller parses `multica ... --output json` through one function per command shape,
+# so a new envelope is either understood or rejected with the command and top-level keys.
+ENVELOPE_KEYS = ("data", "result", "results", "items", "item", "nodes", "edges", "payload", "response")
+ENV_KEYS = ("custom_env", "env", "environment", "variables", "vars")
+
+
+class MulticaShapeError(ValueError):
+    def __init__(self, command, value, expected):
+        command = command if isinstance(command, str) else " ".join(command)
+        if isinstance(value, dict):
+            # Only key names are shown: values may be secrets (custom_env) and are never printed.
+            names = sorted(str(k) for k in value)
+            shape = "object with top-level keys [" + ", ".join(names[:20]) + (", ..." if len(names) > 20 else "") + "]"
+        elif isinstance(value, list):
+            shape = f"array of {len(value)} item(s)"
+        else:
+            shape = type(value).__name__
+        super().__init__(f"unexpected JSON from `multica {command}`: got {shape}; expected {expected}. "
+                         "The installed Multica CLI may have changed its output format; nothing was changed based on it.")
+        self.command = command
+
+
+def _candidates(value, names, depth=0):
+    """The value itself, then anything under command-specific or generic envelope keys."""
+    yield value
+    if depth < 3 and isinstance(value, dict):
+        for key in (*names, *ENVELOPE_KEYS):
+            if key in value:
+                yield from _candidates(value[key], names, depth + 1)
+
+
+def multica_rows(value, command, names=()):
+    """List commands: bare arrays, or {data|items|results|<noun>s: [...]} (nested up to 3 levels)."""
+    for candidate in _candidates(value, names):
+        if isinstance(candidate, list) and all(isinstance(row, dict) for row in candidate):
+            # GraphQL-style edges [{"node": {...}}] become plain rows.
+            return [row["node"] if set(row) == {"node"} and isinstance(row["node"], dict) else row
+                    for row in candidate]
+    raise MulticaShapeError(command, value, "a JSON array of objects, optionally wrapped in "
+                            + "/".join((*names, *ENVELOPE_KEYS[:3])))
+
+
+def multica_object(value, command, names=(), required=("id",)):
+    """Get/create/update commands: a bare object, or {data|item|result|<noun>: {...}}."""
+    for candidate in _candidates(value, names):
+        if isinstance(candidate, dict) and all(key in candidate for key in required):
+            return candidate
+    raise MulticaShapeError(command, value, "a JSON object with " + ", ".join(required) +
+                            ", optionally wrapped in " + "/".join((*names, *ENVELOPE_KEYS[:3])))
+
+
+def multica_env(value, command="agent env get"):
+    """`agent env get`: flat {"KEY": "value"} (0.6.3), {"agent_id", "custom_env": {...}} (0.6.5),
+    {env|environment|data: ...}, or a list of {"key"|"name", "value"} pairs. Returns a str map."""
+    for candidate in _candidates(value, ENV_KEYS):
+        if isinstance(candidate, dict):
+            if any(key in candidate for key in (*ENV_KEYS, *ENVELOPE_KEYS)):
+                if any(candidate.get(key, "") is None for key in ENV_KEYS):
+                    return {}
+                continue
+            if all(isinstance(k, str) and isinstance(v, str) for k, v in candidate.items()):
+                return dict(candidate)
+        elif isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
+            pairs = {}
+            for item in candidate:
+                key, val = item.get("key", item.get("name")), item.get("value")
+                if not isinstance(key, str) or not isinstance(val, str):
+                    break
+                pairs[key] = val
+            else:
+                return pairs
+    raise MulticaShapeError(command, value, "a JSON map of string values, optionally wrapped in "
+                            + "/".join(ENV_KEYS[:2]) + " or data, or a list of {key,value}")
+
+
+def multica_field(obj, *paths, default=None):
+    """First present value among dotted paths, e.g. multica_field(row, "profile_id", "profile.id")."""
+    for path in paths:
+        value = obj
+        for part in path.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        if value is not None:
+            return value
+    return default
+
+
+def multica_daemon(value, command="daemon status"):
+    """`daemon status`: normalized status/pid/daemon_id/device_name/workspace_ids."""
+    for candidate in _candidates(value, ("daemon",)):
+        if isinstance(candidate, dict) and ("status" in candidate or "state" in candidate):
+            raw = candidate
+            break
+    else:
+        raise MulticaShapeError(command, value, "a JSON object with status and pid")
+    status = multica_field(raw, "status", "state", default="")
+    workspaces = multica_field(raw, "workspaces", "workspace_ids", default=[])
+    if isinstance(workspaces, dict):
+        workspaces = multica_rows(workspaces, command + " workspaces", ("workspaces",))
+    if not isinstance(workspaces, list):
+        raise MulticaShapeError(command, value, "workspaces as an array")
+    ids = [w if isinstance(w, str) else multica_field(w, "id", "workspace_id", "workspace.id")
+           for w in workspaces]
+    return {"status": str(status).lower() if isinstance(status, str) else status,
+            "pid": multica_field(raw, "pid", "process.pid"),
+            "daemon_id": multica_field(raw, "daemon_id", "id", "daemon.id"),
+            "device_name": multica_field(raw, "device_name", "hostname", default=""),
+            "workspace_ids": [i for i in ids if isinstance(i, str) and i]}
+
+
+def multica_int(value):
+    """Integers that may arrive as JSON numbers or numeric strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def multica_help_flags(text):
+    """Long flags advertised by `multica <command> --help` (capability detection, not versions)."""
+    return set(re.findall(r"(?m)^\s+(?:-\w,\s+)?(--[A-Za-z0-9][\w-]*)", text or ""))
+# --- end of Multica CLI JSON normalizers ---
+
+
 def emit(event_type, data=None, **fields):
     event = {"type": event_type, **fields}
     if data is not None:
@@ -171,7 +300,7 @@ def child(args, *, body=None, env=None, cwd=None, timeout=60, stderr=subprocess.
                 try:
                     status = subprocess.run([args[0], "daemon", "status", "--output", "json"],
                         capture_output=True, text=True, timeout=3)
-                    daemon_pid = json.loads(status.stdout).get("pid")
+                    daemon_pid = multica_daemon(json.loads(status.stdout))["pid"]
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     daemon_pid = None
                 if daemon_pid is not None and str(daemon_pid) == str(process.pid):
@@ -180,6 +309,20 @@ def child(args, *, body=None, env=None, cwd=None, timeout=60, stderr=subprocess.
             process.wait()
             raise
         return process.returncode, out, err or ""
+
+
+def project_fields(data, fields):
+    """Keep requested top-level fields of an object or of each row, even inside a list envelope."""
+    if isinstance(data, list):
+        return [{k: row[k] for k in fields if k in row} if isinstance(row, dict) else row for row in data]
+    if isinstance(data, dict):
+        if not any(k in data for k in fields):
+            try:
+                return project_fields(multica_rows(data, "list"), fields)
+            except MulticaShapeError:
+                pass
+        return {k: data[k] for k in fields if k in data}
+    return data
 
 
 class Tools:
@@ -353,10 +496,7 @@ class Tools:
                     "write_may_have_committed": command[-1] not in READ_VERBS})
         result = {"ok": code == 0, "exit_code": code, "data": data}
         if code == 0 and fields:
-            if isinstance(data, list):
-                result["data"] = [{k: row[k] for k in fields if k in row} if isinstance(row, dict) else row for row in data]
-            elif isinstance(data, dict):
-                result["data"] = {k: data[k] for k in fields if k in data}
+            result["data"] = project_fields(data, fields)
         if err.strip():
             result["stderr"] = err.strip()
         if code and command[-1] not in READ_VERBS:

@@ -109,6 +109,30 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         self.assertEqual(after['writes'].count('profile.create'), 1)
         self.assertEqual(hashlib.sha256((ROOT / 'vendor/grok-bot-bridge-0.2.0.tgz').read_bytes()).hexdigest(), INSTALL['ARCHIVE_SHA256'])
 
+    def test_server_install_tolerates_multica_output_shapes(self):
+        # 0.6.5 wraps `agent env get` in custom_env; a future CLI may wrap every response.
+        original = self.state.read_text()
+        try:
+            for shape in ('custom_env', 'wrapped'):
+                current = json.loads(self.state.read_text())
+                current.update(shape=shape)
+                current['env']['GBB_WAIT'] = '900'
+                self.state.write_text(json.dumps(current))
+                for suffix in ([], ['--check']):
+                    result = subprocess.run(self.command + suffix, env=self.env, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.returncode, 0, (shape, result.stdout, result.stderr))
+                    self.assertNotIn('OFFLINE_SECRET_NEVER_PRINT', result.stdout + result.stderr)
+                after = json.loads(self.state.read_text())
+                self.assertEqual(after['env']['GBB_WAIT'], '3600')
+                self.assertEqual(after['writes'].count('agent.create'), 1)
+            current = json.loads(self.state.read_text())
+            self.state.write_text(json.dumps(dict(current, shape='unknown_env')))
+            result = subprocess.run(self.command + ['--check'], env=self.env, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('multica agent env get', result.stderr)
+        finally:
+            self.state.write_text(original)
+
     def test_mac_routes_answers_and_instance_guard(self):
         config_root = self.mac_home / '.config/gbb-multica'
         bin_dir = self.mac_home / '.local/bin'

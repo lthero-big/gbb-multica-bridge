@@ -168,6 +168,135 @@ class BridgeError(Exception):
         self.code = code
 
 
+# --- Multica CLI JSON normalizers (single source; gbb-multica-setup.sh embeds this file
+# and install.py loads it). Multica changes JSON envelopes between releases: 0.6.3 printed
+# `agent env get` as a flat map, 0.6.5 wraps it as {"agent_id", "custom_env": {...}}.
+# Every caller parses `multica ... --output json` through one function per command shape,
+# so a new envelope is either understood or rejected with the command and top-level keys.
+ENVELOPE_KEYS = ("data", "result", "results", "items", "item", "nodes", "edges", "payload", "response")
+ENV_KEYS = ("custom_env", "env", "environment", "variables", "vars")
+
+
+class MulticaShapeError(ValueError):
+    def __init__(self, command, value, expected):
+        command = command if isinstance(command, str) else " ".join(command)
+        if isinstance(value, dict):
+            # Only key names are shown: values may be secrets (custom_env) and are never printed.
+            names = sorted(str(k) for k in value)
+            shape = "object with top-level keys [" + ", ".join(names[:20]) + (", ..." if len(names) > 20 else "") + "]"
+        elif isinstance(value, list):
+            shape = f"array of {len(value)} item(s)"
+        else:
+            shape = type(value).__name__
+        super().__init__(f"unexpected JSON from `multica {command}`: got {shape}; expected {expected}. "
+                         "The installed Multica CLI may have changed its output format; nothing was changed based on it.")
+        self.command = command
+
+
+def _candidates(value, names, depth=0):
+    """The value itself, then anything under command-specific or generic envelope keys."""
+    yield value
+    if depth < 3 and isinstance(value, dict):
+        for key in (*names, *ENVELOPE_KEYS):
+            if key in value:
+                yield from _candidates(value[key], names, depth + 1)
+
+
+def multica_rows(value, command, names=()):
+    """List commands: bare arrays, or {data|items|results|<noun>s: [...]} (nested up to 3 levels)."""
+    for candidate in _candidates(value, names):
+        if isinstance(candidate, list) and all(isinstance(row, dict) for row in candidate):
+            # GraphQL-style edges [{"node": {...}}] become plain rows.
+            return [row["node"] if set(row) == {"node"} and isinstance(row["node"], dict) else row
+                    for row in candidate]
+    raise MulticaShapeError(command, value, "a JSON array of objects, optionally wrapped in "
+                            + "/".join((*names, *ENVELOPE_KEYS[:3])))
+
+
+def multica_object(value, command, names=(), required=("id",)):
+    """Get/create/update commands: a bare object, or {data|item|result|<noun>: {...}}."""
+    for candidate in _candidates(value, names):
+        if isinstance(candidate, dict) and all(key in candidate for key in required):
+            return candidate
+    raise MulticaShapeError(command, value, "a JSON object with " + ", ".join(required) +
+                            ", optionally wrapped in " + "/".join((*names, *ENVELOPE_KEYS[:3])))
+
+
+def multica_env(value, command="agent env get"):
+    """`agent env get`: flat {"KEY": "value"} (0.6.3), {"agent_id", "custom_env": {...}} (0.6.5),
+    {env|environment|data: ...}, or a list of {"key"|"name", "value"} pairs. Returns a str map."""
+    for candidate in _candidates(value, ENV_KEYS):
+        if isinstance(candidate, dict):
+            if any(key in candidate for key in (*ENV_KEYS, *ENVELOPE_KEYS)):
+                if any(candidate.get(key, "") is None for key in ENV_KEYS):
+                    return {}
+                continue
+            if all(isinstance(k, str) and isinstance(v, str) for k, v in candidate.items()):
+                return dict(candidate)
+        elif isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
+            pairs = {}
+            for item in candidate:
+                key, val = item.get("key", item.get("name")), item.get("value")
+                if not isinstance(key, str) or not isinstance(val, str):
+                    break
+                pairs[key] = val
+            else:
+                return pairs
+    raise MulticaShapeError(command, value, "a JSON map of string values, optionally wrapped in "
+                            + "/".join(ENV_KEYS[:2]) + " or data, or a list of {key,value}")
+
+
+def multica_field(obj, *paths, default=None):
+    """First present value among dotted paths, e.g. multica_field(row, "profile_id", "profile.id")."""
+    for path in paths:
+        value = obj
+        for part in path.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        if value is not None:
+            return value
+    return default
+
+
+def multica_daemon(value, command="daemon status"):
+    """`daemon status`: normalized status/pid/daemon_id/device_name/workspace_ids."""
+    for candidate in _candidates(value, ("daemon",)):
+        if isinstance(candidate, dict) and ("status" in candidate or "state" in candidate):
+            raw = candidate
+            break
+    else:
+        raise MulticaShapeError(command, value, "a JSON object with status and pid")
+    status = multica_field(raw, "status", "state", default="")
+    workspaces = multica_field(raw, "workspaces", "workspace_ids", default=[])
+    if isinstance(workspaces, dict):
+        workspaces = multica_rows(workspaces, command + " workspaces", ("workspaces",))
+    if not isinstance(workspaces, list):
+        raise MulticaShapeError(command, value, "workspaces as an array")
+    ids = [w if isinstance(w, str) else multica_field(w, "id", "workspace_id", "workspace.id")
+           for w in workspaces]
+    return {"status": str(status).lower() if isinstance(status, str) else status,
+            "pid": multica_field(raw, "pid", "process.pid"),
+            "daemon_id": multica_field(raw, "daemon_id", "id", "daemon.id"),
+            "device_name": multica_field(raw, "device_name", "hostname", default=""),
+            "workspace_ids": [i for i in ids if isinstance(i, str) and i]}
+
+
+def multica_int(value):
+    """Integers that may arrive as JSON numbers or numeric strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def multica_help_flags(text):
+    """Long flags advertised by `multica <command> --help` (capability detection, not versions)."""
+    return set(re.findall(r"(?m)^\s+(?:-\w,\s+)?(--[A-Za-z0-9][\w-]*)", text or ""))
+# --- end of Multica CLI JSON normalizers ---
+
+
 def emit(event_type, data=None, **fields):
     event = {"type": event_type, **fields}
     if data is not None:
@@ -191,7 +320,7 @@ def child(args, *, body=None, env=None, cwd=None, timeout=60, stderr=subprocess.
                 try:
                     status = subprocess.run([args[0], "daemon", "status", "--output", "json"],
                         capture_output=True, text=True, timeout=3)
-                    daemon_pid = json.loads(status.stdout).get("pid")
+                    daemon_pid = multica_daemon(json.loads(status.stdout))["pid"]
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     daemon_pid = None
                 if daemon_pid is not None and str(daemon_pid) == str(process.pid):
@@ -200,6 +329,20 @@ def child(args, *, body=None, env=None, cwd=None, timeout=60, stderr=subprocess.
             process.wait()
             raise
         return process.returncode, out, err or ""
+
+
+def project_fields(data, fields):
+    """Keep requested top-level fields of an object or of each row, even inside a list envelope."""
+    if isinstance(data, list):
+        return [{k: row[k] for k in fields if k in row} if isinstance(row, dict) else row for row in data]
+    if isinstance(data, dict):
+        if not any(k in data for k in fields):
+            try:
+                return project_fields(multica_rows(data, "list"), fields)
+            except MulticaShapeError:
+                pass
+        return {k: data[k] for k in fields if k in data}
+    return data
 
 
 class Tools:
@@ -373,10 +516,7 @@ class Tools:
                     "write_may_have_committed": command[-1] not in READ_VERBS})
         result = {"ok": code == 0, "exit_code": code, "data": data}
         if code == 0 and fields:
-            if isinstance(data, list):
-                result["data"] = [{k: row[k] for k in fields if k in row} if isinstance(row, dict) else row for row in data]
-            elif isinstance(data, dict):
-                result["data"] = {k: data[k] for k in fields if k in data}
+            result["data"] = project_fields(data, fields)
         if err.strip():
             result["stderr"] = err.strip()
         if code and command[-1] not in READ_VERBS:
@@ -608,6 +748,14 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+# The embedded wrapper is the single source of the Multica JSON normalizers; load it
+# as a module (its main() is guarded) so setup and the wrapper parse output identically.
+_SHARED = {"__name__": "gbb_multica_agent_embedded"}
+exec(compile(WRAPPER_SOURCE, "gbb-multica-agent", "exec"), _SHARED)
+MulticaShapeError = _SHARED["MulticaShapeError"]
+multica_rows, multica_object, multica_env = _SHARED["multica_rows"], _SHARED["multica_object"], _SHARED["multica_env"]
+multica_field, multica_daemon, multica_int = _SHARED["multica_field"], _SHARED["multica_daemon"], _SHARED["multica_int"]
+multica_help_flags = _SHARED["multica_help_flags"]
 PROFILE_NAME = "Grok Bot Bridge"
 WRAPPER_NAME = "gbb-multica-agent"
 TOOL_INSTRUCTIONS = (
@@ -652,6 +800,21 @@ def read_object(path, label):
     return value
 
 
+def empty_args(value):
+    """custom_args/fixed_args arrive as null, "", "[]" or [] depending on the Multica version."""
+    return value in (None, "", "[]", [], {})
+
+
+def runtime_id_of(agent):
+    return multica_field(agent, "runtime_id", "runtime.id")
+
+
+def agent_misbound(agent, runtime):
+    return (not runtime or runtime_id_of(agent) != runtime["id"] or agent.get("model")
+            or agent.get("thinking_level") or agent.get("service_tier")
+            or not empty_args(agent.get("custom_args")) or multica_int(agent.get("max_concurrent_tasks")) != 1)
+
+
 def one(rows, label):
     require(len(rows) <= 1, f"发现多个{label}，无法自动判断；请先处理重名资源后重跑。")
     return rows[0] if rows else None
@@ -691,29 +854,77 @@ def main():
     if opts.workspace_id:
         base += ["--workspace-id", opts.workspace_id]
 
-    def cli(*args, body=None, parse_json=True):
+    help_cache = {}
+
+    def flags(command):
+        """Capability detection: long flags listed by `multica <command> --help` (empty if unknown)."""
+        if command not in help_cache:
+            try:
+                shown = subprocess.run([*login_base, *command.split(), "--help"], text=True,
+                                       capture_output=True, timeout=30)
+                help_cache[command] = (multica_help_flags(shown.stdout + shown.stderr)
+                                       if shown.returncode == 0 else set())
+            except subprocess.TimeoutExpired:
+                help_cache[command] = set()
+        return help_cache[command]
+
+    def cli(command, *args, body=None, parse_json=True):
+        available = flags(command) if parse_json else set()
+        # Older/unknown help output: keep requesting JSON; only drop it when help omits --output.
+        output = ["--output", "json"] if parse_json and (not available or "--output" in available) else []
         try:
-            result = subprocess.run([*base, *args], input=body, text=True,
+            result = subprocess.run([*base, *command.split(), *args, *output], input=body, text=True,
                                     capture_output=True, timeout=60)
         except subprocess.TimeoutExpired:
-            raise SetupError(f"Multica 命令超时：{' '.join(args[:3])}。写操作结果可能已生效；先查询现状再重跑。") from None
+            raise SetupError(f"Multica 命令超时：{command}。写操作结果可能已生效；先查询现状再重跑。") from None
         # Never print env payloads, webhook credentials or raw secret responses.
         require(result.returncode == 0,
-                f"Multica 命令失败：{' '.join(args[:3])}（退出码 {result.returncode}）。请检查登录身份及权限。")
+                f"Multica 命令失败：{command}（退出码 {result.returncode}）。请检查登录身份及权限。")
         if not parse_json:
             return result.stdout
         try:
             return json.loads(result.stdout)
         except ValueError:
-            raise SetupError(f"命令未返回有效 JSON：{' '.join(args[:3])}。请先查询现状，不要重复创建。") from None
+            raise SetupError(f"命令未返回有效 JSON：multica {command}。请先查询现状，不要重复创建。") from None
 
-    workspace = cli("workspace", "get", "--output", "json")
+    def cli_with_env(command, *args, values):
+        """Pass custom env through stdin, or a private 0600 file on CLIs without stdin input; never argv."""
+        available = flags(command)
+        if not available or "--custom-env-stdin" in available:
+            return cli(command, *args, "--custom-env-stdin", body=json.dumps(values))
+        require("--custom-env-file" in available,
+                f"multica {command} 不支持 --custom-env-stdin / --custom-env-file；为避免在命令行暴露环境变量已停止。")
+        fd, name = tempfile.mkstemp(prefix=".gbb-env-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(values, stream)
+            return cli(command, *args, "--custom-env-file", name)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+    def get_agent(agent_id):
+        return multica_object(cli("agent get", agent_id), "agent get", ("agent",))
+
+    def get_env(agent_id):
+        return multica_env(cli("agent env get", agent_id), "agent env get")
+
+    def list_agents():
+        return multica_rows(cli("agent list"), "agent list", ("agents",))
+
+    def list_profiles():
+        return multica_rows(cli("runtime profile list"), "runtime profile list", ("profiles", "runtime_profiles"))
+
+    def profile_named(name):
+        return one([p for p in list_profiles() if multica_field(p, "display_name", "name") == name], "Bridge profile")
+
+    workspace = multica_object(cli("workspace get"), "workspace get", ("workspace",))
     workspace_id = workspace["id"]
     base = [*login_base, "--workspace-id", workspace_id]
-    daemon = cli("daemon", "status", "--output", "json")
-    require(daemon.get("status") == "running", "本机 daemon 未运行，请先在普通终端启动 daemon。")
+    daemon = multica_daemon(cli("daemon status"))
+    require(daemon["status"] == "running", "本机 daemon 未运行，请先在普通终端启动 daemon。")
     daemon_id = daemon["daemon_id"]
-    require(any(w.get("id") == workspace_id for w in daemon.get("workspaces", [])),
+    require(isinstance(daemon_id, str) and daemon_id, "daemon status 未返回 daemon_id；请检查 Multica CLI 输出。")
+    require(workspace_id in daemon["workspace_ids"],
             "当前工作区不在本机 daemon 的工作区列表中；请检查工作区或 daemon 登录配置。")
     try:
         pid = int(daemon['pid'])
@@ -770,16 +981,14 @@ def main():
     require(not wrapper.is_symlink(), f"包装路径是符号链接，先检查其目标：{wrapper}")
     wrapper_ok = wrapper.is_file() and wrapper.read_bytes() == source.encode() and os.access(wrapper, os.X_OK)
 
-    profiles = cli("runtime", "profile", "list", "--output", "json")
-    profile = one([p for p in profiles if p.get("display_name") == opts.runtime_profile_name], "Bridge profile")
+    profile = profile_named(opts.runtime_profile_name)
     if profile:
-        require(profile.get("protocol_family") == "copilot" and
-                profile.get("command_name") == WRAPPER_NAME and not profile.get("fixed_args"),
+        require(multica_field(profile, "protocol_family", "protocol") == "copilot" and
+                profile.get("command_name") == WRAPPER_NAME and empty_args(profile.get("fixed_args")),
                 "现有同名 profile 的协议、命令或固定参数不兼容；请先检查，脚本不会覆盖其他协议。")
-    agents = cli("agent", "list", "--output", "json")
-    agent = one([a for a in agents if a.get("name") == opts.agent_name], "同名测试 agent")
+    agent = one([a for a in list_agents() if a.get("name") == opts.agent_name], "同名测试 agent")
     if agent:
-        agent = cli("agent", "get", agent["id"], "--output", "json")
+        agent = get_agent(agent["id"])
     wanted_env = {"GBB_HOME": str(gbb_home), "GBB_TARGET_BOT": target, "GBB_WAIT": str(opts.wait)}
     if opts.instance_id:
         wanted_env["GBB_INSTANCE_ID"] = opts.instance_id
@@ -787,9 +996,7 @@ def main():
         wanted_env["GBB_REPLY_ROUTE"] = opts.reply_route
     env_current = None
     if agent and not task_context:
-        env_current = cli("agent", "env", "get", agent["id"], "--output", "json")
-        require(isinstance(env_current, dict) and all(isinstance(v, str) for v in env_current.values()),
-                "agent 环境变量返回格式异常；停止以保留现有配置。")
+        env_current = get_env(agent["id"])
 
     if env_current is not None and opts.instance_id:
         require(env_current.get("GBB_INSTANCE_ID") in (None, opts.instance_id),
@@ -798,9 +1005,10 @@ def main():
     def local_runtime():
         if not profile:
             return None
-        runtimes = cli("runtime", "list", "--output", "json")
-        return one([r for r in runtimes if r.get("profile_id") == profile["id"] and
-                    r.get("daemon_id") == daemon_id and r.get("status") == "online"], "本机在线 Bridge runtime")
+        runtimes = multica_rows(cli("runtime list"), "runtime list", ("runtimes",))
+        return one([r for r in runtimes if multica_field(r, "profile_id", "profile.id") == profile["id"] and
+                    multica_field(r, "daemon_id", "daemon.id") == daemon_id and
+                    str(multica_field(r, "status", "state", default="")).lower() == "online"], "本机在线 Bridge runtime")
 
     runtime = local_runtime()
     needs = []
@@ -812,9 +1020,7 @@ def main():
         needs.append("等待本机 Bridge runtime 在线")
     if not agent:
         needs.append("创建测试 agent")
-    elif (not runtime or agent.get("runtime_id") != runtime["id"] or agent.get("model")
-          or agent.get("thinking_level") or agent.get("service_tier") or agent.get("custom_args")
-          or agent.get("max_concurrent_tasks") != 1):
+    elif agent_misbound(agent, runtime):
         needs.append("修正测试 agent 的本机 runtime/包装参数")
     if agent and agent.get("instructions") != upgraded_instructions(agent):
         needs.append("启用 Multica 查询/创建/编辑工具指令")
@@ -827,8 +1033,9 @@ def main():
         return 2 if needs else 0
 
     if agent:
-        runs = cli("agent", "tasks", agent["id"], "--limit", "10", "--output", "json")
-        require(not any(r.get("status") in ("pending", "queued", "running", "waiting", "in_progress") for r in runs),
+        runs = multica_rows(cli("agent tasks", agent["id"], "--limit", "10"), "agent tasks", ("tasks", "runs"))
+        require(not any(str(multica_field(r, "status", "state", default="")).lower() in
+                        ("pending", "queued", "running", "waiting", "in_progress") for r in runs),
                 "测试 agent 仍有进行中的请求，请先完成回填或取消，再运行配置脚本。")
     lock_dir = Path(daemon_user.pw_dir) / ".local/state/gbb-multica"
     lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -857,16 +1064,17 @@ def main():
     require(version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.4.0", "包装版本检查失败。")
 
     # Re-read after acquiring the lock to avoid duplicate local creations.
-    profiles = cli("runtime", "profile", "list", "--output", "json")
-    profile = one([p for p in profiles if p.get("display_name") == opts.runtime_profile_name], "Bridge profile")
+    profile = profile_named(opts.runtime_profile_name)
     if not profile:
-        profile = cli("runtime", "profile", "create", "--display-name", opts.runtime_profile_name,
-                      "--protocol-family", "copilot", "--command-name", WRAPPER_NAME,
-                      "--description", "通过本机 gbb 连接现有 Grok Bot，支持 Multica 任务工具循环", "--output", "json")
+        profile = multica_object(cli("runtime profile create", "--display-name", opts.runtime_profile_name,
+                                     "--protocol-family", "copilot", "--command-name", WRAPPER_NAME,
+                                     "--description", "通过本机 gbb 连接现有 Grok Bot，支持 Multica 任务工具循环"),
+                                 "runtime profile create", ("profile", "runtime_profile"))
         print(f"已创建 profile：{profile['id']}")
     elif not profile.get("enabled", True):
-        profile = cli("runtime", "profile", "update", profile["id"], "--enabled=true", "--output", "json")
-    cli("runtime", "profile", "set-path", profile["id"], "--path", str(wrapper), parse_json=False)
+        profile = multica_object(cli("runtime profile update", profile["id"], "--enabled=true"),
+                                 "runtime profile update", ("profile", "runtime_profile"))
+    cli("runtime profile set-path", profile["id"], "--path", str(wrapper), parse_json=False)
     deadline = time.monotonic() + 45
     runtime = local_runtime()
     while not runtime and time.monotonic() < deadline:
@@ -875,38 +1083,41 @@ def main():
     require(runtime, "45 秒内尚未发现本机在线 runtime。已保留 profile 和路径，请稍后重跑；不会重复创建。")
     print(f"已选本机 runtime：{runtime['id']}（daemon {daemon_id}）")
 
-    agents = cli("agent", "list", "--output", "json")
-    agent = one([a for a in agents if a.get("name") == opts.agent_name], "同名测试 agent")
+    agent = one([a for a in list_agents() if a.get("name") == opts.agent_name], "同名测试 agent")
     if agent:
-        agent = cli("agent", "get", agent["id"], "--output", "json")
+        agent = get_agent(agent["id"])
     if not agent:
-        agent = cli("agent", "create", "--name", opts.agent_name, "--runtime-id", runtime["id"],
-                    "--description", "通过现有 Grok Bot 查询、创建和编辑 Multica 资源",
-                    "--instructions", TOOL_INSTRUCTIONS,
-                    "--max-concurrent-tasks", "1", "--custom-env-stdin", "--output", "json",
-                    body=json.dumps(wanted_env))
+        agent = multica_object(cli_with_env("agent create", "--name", opts.agent_name, "--runtime-id", runtime["id"],
+                                            "--description", "通过现有 Grok Bot 查询、创建和编辑 Multica 资源",
+                                            "--instructions", TOOL_INSTRUCTIONS,
+                                            "--max-concurrent-tasks", "1", values=wanted_env),
+                               "agent create", ("agent",))
         print(f"已创建 agent：{agent['id']}")
     else:
-        if (agent.get("runtime_id") != runtime["id"] or agent.get("model") or agent.get("thinking_level")
-            or agent.get("service_tier") or agent.get("custom_args") or agent.get("max_concurrent_tasks") != 1
-            or agent.get("instructions") != upgraded_instructions(agent)):
-            print(f"修正 agent 绑定：{agent.get('runtime_id')} → {runtime['id']}")
-            cli("agent", "update", agent["id"], "--runtime-id", runtime["id"], "--model", "",
+        if agent_misbound(agent, runtime) or agent.get("instructions") != upgraded_instructions(agent):
+            print(f"修正 agent 绑定：{runtime_id_of(agent)} → {runtime['id']}")
+            cli("agent update", agent["id"], "--runtime-id", runtime["id"], "--model", "",
                 "--thinking-level", "", "--service-tier", "", "--custom-args", "[]",
                 "--instructions", upgraded_instructions(agent),
-                "--max-concurrent-tasks", "1", "--output", "json")
-        env_current = cli("agent", "env", "get", agent["id"], "--output", "json")
-        require(isinstance(env_current, dict) and all(isinstance(v, str) for v in env_current.values()),
-                "agent 环境变量格式异常；未覆盖。")
+                "--max-concurrent-tasks", "1")
+        env_current = get_env(agent["id"])
         merged = {**env_current, **wanted_env}
         if merged != env_current:
-            cli("agent", "env", "set", agent["id"], "--custom-env-stdin", "--output", "json",
-                body=json.dumps(merged))
+            cli_with_env("agent env set", agent["id"], values=merged)
             print("已合并修正 gbb 环境变量，保留其他条目。")
-    verified = cli("agent", "get", agent["id"], "--output", "json")
-    verified_env = cli("agent", "env", "get", agent["id"], "--output", "json")
-    require(verified.get("runtime_id") == runtime["id"] and "GBB_TOOL_PROTOCOL_V1" in (verified.get("instructions") or "") and
-            all(verified_env.get(k) == v for k, v in wanted_env.items()), "配置回读不一致，请检查后重跑。")
+    verified = get_agent(agent["id"])
+    verified_env = get_env(agent["id"])
+    # Compare normalized values only for the keys this script sets; report key names, never values.
+    problems = []
+    if runtime_id_of(verified) != runtime["id"]:
+        problems.append("runtime_id")
+    if "GBB_TOOL_PROTOCOL_V1" not in (verified.get("instructions") or ""):
+        problems.append("instructions")
+    mismatched = sorted(k for k, v in wanted_env.items() if verified_env.get(k) != v)
+    if mismatched:
+        masked = [k for k in mismatched if set(verified_env.get(k) or "") == {"*"}]
+        problems.append("环境变量 " + ", ".join(mismatched) + ("（CLI 返回了掩码值，无法核对）" if masked else ""))
+    require(not problems, "配置回读不一致：" + "；".join(problems) + "。请检查后重跑。")
     print(f"配置完成：{opts.agent_name}；agent {agent['id']}")
     print("未发送 Grok 请求。现在可新开该 agent 的聊天，只发送一次：请只回复 GBB_RUNTIME_OK。")
     print("查看消息：" + shlex.join(["env", f"GBB_HOME={gbb_home}", gbb_bin, "inbox", "--limit", "10"]))
@@ -917,7 +1128,7 @@ def main():
 
 try:
     raise SystemExit(main())
-except (SetupError, OSError, subprocess.SubprocessError) as exc:
+except (SetupError, MulticaShapeError, OSError, subprocess.SubprocessError) as exc:
     print(f"配置停止：{exc}", file=sys.stderr)
     raise SystemExit(1)
 GBB_SETUP_PY
