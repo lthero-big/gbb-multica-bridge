@@ -19,14 +19,35 @@ while a[:1] in (["--workspace-id"], ["--profile"]):
 s["calls"].append(a)
 def val(flag): return a[a.index(flag)+1]
 def write(kind): s["writes"].append(kind)
+def env_in():
+ if "--custom-env-file" in a:
+  path=val("--custom-env-file"); assert (os.stat(path).st_mode & 0o077)==0; return json.loads(Path(path).read_text())
+ assert "--custom-env-stdin" in a
+ return json.loads(sys.stdin.read())
+# shape: None/"flat" = Multica 0.6.3, "custom_env" = 0.6.5, "wrapped" = plausible future envelopes,
+# "unknown_env" = an env envelope the bridge must refuse to guess.
+shape=s.get("shape")
+def rows(v): return {"data":{"items":v},"next_cursor":None} if shape=="wrapped" else v
+def obj(v): return {"data":v} if shape=="wrapped" else v
+def env_out(agent_id, env):
+ if shape=="custom_env": return {"agent_id":agent_id,"custom_env":env}
+ if shape=="wrapped": return {"data":{"agent_id":agent_id,"env":[{"key":k,"value":v} for k,v in env.items()]}}
+ if shape=="unknown_env": return {"agent_id":agent_id,"secrets":env}
+ return env
 out=None
 raw=False
+if "--help" in a:
+ flags=["--help","--output","--custom-env-stdin","--custom-env-file","--limit"]
+ flags=[f for f in flags if f not in s.get("missing_flags",[])]
+ out="Usage:\n  multica "+" ".join(a[:-1])+" [flags]\n\nFlags:\n"+"".join("      "+f+" string\n" for f in flags); raw=True
+ print(out); sys.exit(0)
 if a[:2]==["workspace","get"]:
  out={"id":"setup-test-workspace","name":"Fake workspace"}
 elif a[:2]==["daemon","status"]:
  out={"pid":s["daemon_pid"],"status":"running","daemon_id":"setup-test-daemon",
       "device_name":"local-test-machine","workspaces":[{"id":"setup-test-workspace"}]}
-elif a[:3]==["runtime","profile","list"]: out=s["profiles"]
+ if shape=="wrapped": out={"data":{"daemon":dict(out,status="RUNNING",workspaces=["setup-test-workspace"])}}
+elif a[:3]==["runtime","profile","list"]: out=rows(s["profiles"])
 elif a[:3]==["runtime","profile","create"]:
  write("profile.create")
  out={"id":"test-profile","display_name":val("--display-name"),"protocol_family":"copilot",
@@ -41,15 +62,13 @@ elif a[:2]==["runtime","list"]:
  out=[{"id":"foreign-runtime","profile_id":"test-profile","daemon_id":"different-machine","status":"online"}]
  if s.get("path"):
   out.append({"id":"local-runtime","profile_id":"test-profile","daemon_id":"setup-test-daemon","status":"online"})
-elif a[:2]==["agent","list"]: out=s["agents"]
-elif a[:3]==["agent","env","get"]: out=s["env"]
+elif a[:2]==["agent","list"]: out=rows(s["agents"])
+elif a[:3]==["agent","env","get"]: out=env_out(a[3],s["env"])
 elif a[:3]==["agent","env","set"]:
- assert "--custom-env-stdin" in a
- write("env.set"); s["env"]=json.loads(sys.stdin.read()); out=s["env"]
-elif a[:2]==["agent","tasks"]: out=s.get("runs",[])
+ write("env.set"); s["env"]={k:v for k,v in env_in().items() if k not in s.get("drop_env",[])}; out=env_out(a[3],s["env"])
+elif a[:2]==["agent","tasks"]: out=rows(s.get("runs",[]))
 elif a[:2]==["agent","create"]:
- assert "--custom-env-stdin" in a
- write("agent.create"); s["env"]=json.loads(sys.stdin.read())
+ write("agent.create"); s["env"]=env_in()
  out={"id":"test-agent","name":val("--name"),"runtime_id":val("--runtime-id"),
       "model":"","custom_args":[],"max_concurrent_tasks":1,"instructions":val("--instructions")}
  s["agents"].append(out)
@@ -62,6 +81,9 @@ elif a[:2]==["agent","get"]: out=s["agents"][0]
 else:
  print("Unexpected fake CLI call",file=sys.stderr); sys.exit(8)
 p.write_text(json.dumps(s))
+if not raw and (a[:2] in (["workspace","get"],["agent","get"],["agent","create"],["agent","update"]) or
+                a[:3] in (["runtime","profile","create"],["runtime","profile","update"])):
+ out=obj(out)
 print(out if raw else json.dumps(out))
 '''
 
@@ -187,6 +209,53 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             passed(run())
             assert state()["writes"].count("profile.create")==1, "a committed write with bad response must not be retried blindly"
 
+            # Multica output shapes: 0.6.3 flat env (above), 0.6.5 {"agent_id","custom_env"},
+            # and a plausible future release that wraps every response in envelopes.
+            for shape in ("custom_env", "wrapped"):
+                reset(shape=shape, profiles=[profile.copy()], agents=[agent.copy()],
+                      env={"GBB_HOME":"/wrong-machine","EXISTING_SECRET":"KEEP_FAKE_SECRET"})
+                assert run("--check").returncode==2 and state()["writes"]==[], shape
+                passed(run())
+                shaped=state()
+                assert shaped["env"]=={"GBB_HOME":str(home),"GBB_TARGET_BOT":"bridge","GBB_WAIT":"3600",
+                                       "EXISTING_SECRET":"KEEP_FAKE_SECRET"}, (shape, shaped["env"])
+                assert shaped["agents"][0]["runtime_id"]=="local-runtime" and shaped["writes"].count("env.set")==1
+                passed(run())
+                repeat=[w for w in state()["writes"][len(shaped["writes"]):] if w!="set-path"]
+                assert repeat==[], f"{shape}: a second run must not rewrite the agent: {repeat}"
+                passed(run("--check"))
+                reset(shape=shape)
+                passed(run())
+                assert state()["writes"].count("agent.create")==1 and state()["env"]["GBB_TARGET_BOT"]=="bridge"
+
+            reset(shape="unknown_env", profiles=[profile.copy()], agents=[agent.copy()],
+                  env={"EXISTING_SECRET":"KEEP_FAKE_SECRET"})
+            unknown=run()
+            assert unknown.returncode==1 and state()["writes"]==[], unknown.stderr
+            assert "multica agent env get" in unknown.stderr and "[agent_id, secrets]" in unknown.stderr, unknown.stderr
+            assert "KEEP_FAKE_SECRET" not in unknown.stdout + unknown.stderr
+            assert run("--check").returncode==1
+
+            # CLIs without --custom-env-stdin receive the env through a private file, never argv.
+            reset(missing_flags=["--custom-env-stdin"], profiles=[profile.copy()], agents=[agent.copy()],
+                  env={"EXISTING_SECRET":"KEEP_FAKE_SECRET"})
+            passed(run())
+            filed=state()
+            assert filed["env"]["EXISTING_SECRET"]=="KEEP_FAKE_SECRET" and filed["env"]["GBB_HOME"]==str(home)
+            env_files=[c[c.index("--custom-env-file")+1] for c in filed["calls"] if "--custom-env-file" in c]
+            assert env_files and not any(Path(f).exists() for f in env_files)
+            assert not any("KEEP_FAKE_SECRET" in arg for call in filed["calls"] for arg in call)
+            reset(missing_flags=["--custom-env-stdin","--custom-env-file"])
+            no_env_input=run()
+            assert no_env_input.returncode==1 and "--custom-env-stdin" in no_env_input.stderr
+
+            # Readback compares only the keys setup owns and names mismatches without values.
+            reset(profiles=[profile.copy()], agents=[agent.copy()], drop_env=["GBB_WAIT"],
+                  env={"EXISTING_SECRET":"KEEP_FAKE_SECRET"})
+            mismatch=run()
+            assert mismatch.returncode==1 and "配置回读不一致" in mismatch.stderr and "GBB_WAIT" in mismatch.stderr
+            assert "GBB_HOME" not in mismatch.stderr and "3600" not in mismatch.stderr
+
             reset()
             before_wrapper = wrapper.read_bytes()
             (fake_bin / "webhook.js").write_text("export const VERSION = '0.3.0';\n")
@@ -197,8 +266,60 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
         finally:
             lock=Path(pwd.getpwuid(os.geteuid()).pw_dir)/".local/state/gbb-multica/setup-test-workspace-setup-test-daemon.lock"
             lock.unlink(missing_ok=True)
-    print("PASS: create/reuse, repeat runs, correct-machine binding, env merge, no secret output, check mode, task identity, active-run guard, missing config and partial-write recovery")
+    print("PASS: create/reuse, repeat runs, correct-machine binding, env merge, no secret output, check mode, task identity, active-run guard, missing config, partial-write recovery, Multica 0.6.3/0.6.5/wrapped output shapes, env-file fallback and key-only readback")
+
+
+def check_normalizers():
+    """Shared Multica JSON normalizers: one per command shape, embedded copy kept in sync."""
+    import re
+    import runpy
+    agent_path = SCRIPT.with_name("gbb-multica-agent")
+    embedded = re.search(r"WRAPPER_SOURCE = r\'\'\'(.*?)\n\'\'\'\n", SCRIPT.read_text(), re.S)
+    assert embedded and embedded.group(1) + "\n" == agent_path.read_text(), \
+        "gbb-multica-setup.sh WRAPPER_SOURCE must stay identical to gbb-multica-agent"
+    n = runpy.run_path(str(agent_path))
+    env, rows, obj, daemon = n["multica_env"], n["multica_rows"], n["multica_object"], n["multica_daemon"]
+    want = {"GBB_HOME": "/h", "GBB_WAIT": "3600"}
+    for value in (want,                                               # 0.6.3
+                  {"agent_id": "a", "custom_env": want},              # 0.6.5
+                  {"env": want}, {"data": {"custom_env": want}},      # plausible future envelopes
+                  {"data": {"env": [{"key": k, "value": v} for k, v in want.items()]}},
+                  [{"name": k, "value": v} for k, v in want.items()]):
+        assert env(value) == want, value
+    assert env({}) == {} and env({"agent_id": "a", "custom_env": {}}) == {}
+    assert env({"agent_id": "a", "custom_env": None}) == {}
+    for bad in ({"agent_id": "a", "secrets": {"K": "SECRET_VALUE"}}, {"K": 1}, "text", [1]):
+        try:
+            env(bad)
+        except n["MulticaShapeError"] as exc:
+            assert "multica agent env get" in str(exc) and "SECRET_VALUE" not in str(exc)
+        else:
+            raise AssertionError(bad)
+    row = {"id": "r1", "name": "x"}
+    for value in ([row], {"data": [row]}, {"items": [row]}, {"agents": [row]},
+                  {"data": {"items": [row]}, "next_cursor": None}, {"edges": [{"node": row}]}, {"nodes": [row]},
+                  {"data": [{"node": row}]}):
+        assert rows(value, "agent list", ("agents",)) == [row], value
+    try:
+        rows({"total": 1, "agent": row}, "agent list", ("agents",))
+    except n["MulticaShapeError"] as exc:
+        assert "agent list" in str(exc) and "[agent, total]" in str(exc)
+    else:
+        raise AssertionError("unknown list shape accepted")
+    for value in (row, {"data": row}, {"agent": row}, {"data": {"agent": row}}):
+        assert obj(value, "agent get", ("agent",)) == row
+    flat = {"status": "running", "pid": 7, "daemon_id": "d", "workspaces": [{"id": "w"}]}
+    wrapped = {"data": {"daemon": {"state": "RUNNING", "pid": "7", "id": "d", "workspaces": ["w"]}}}
+    for value in (flat, wrapped):
+        got = daemon(value)
+        assert (got["status"], n["multica_int"](got["pid"]), got["daemon_id"], got["workspace_ids"]) == ("running", 7, "d", ["w"])
+    assert n["multica_help_flags"]("Flags:\n  -h, --help   help\n      --output string\n") == {"--help", "--output"}
+    project = n["project_fields"]
+    assert project({"data": {"items": [{"id": 1, "title": "t", "secret": "x"}]}}, ["id", "title"]) == [{"id": 1, "title": "t"}]
+    assert project({"id": 1, "title": "t", "x": 2}, ["id"]) == {"id": 1}
+    print("PASS: Multica JSON normalizers (0.6.3 flat, 0.6.5 custom_env, wrapped envelopes, unknown-shape errors) and embedded wrapper sync")
 
 
 if __name__=="__main__":
+    check_normalizers()
     check()

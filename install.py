@@ -141,6 +141,18 @@ const {pathToFileURL} = require('node:url');
     print('凭证已保存；未发送测试 ping，也未安装其他 CLI 的技能。')
 
 
+def multica_json(shapes, base, *command):
+    """Run a read-only Multica command as JSON; add --output only when its help advertises it."""
+    shown = subprocess.run([*base, *command, '--help'], text=True, capture_output=True, timeout=30)
+    flags = shapes['multica_help_flags'](shown.stdout + shown.stderr)
+    output = ['--output', 'json'] if '--output' in flags or shown.returncode or not flags else []
+    stdout = run([*base, *command, *output], text=True, capture_output=True).stdout
+    try:
+        return json.loads(stdout)
+    except ValueError:
+        raise ValueError(f'`multica {" ".join(command)}` 未返回有效 JSON；请检查 Multica CLI 版本') from None
+
+
 def runtime(args, config_root, bin_dir):
     require(platform.system() in ('Linux', 'Darwin'), '运行端支持 Linux/macOS')
     task = (os.environ.get('MULTICA_TOKEN', '').startswith('mat_') or
@@ -167,18 +179,18 @@ def runtime(args, config_root, bin_dir):
     workspace = args.workspace_id if args.workspace_id is not None else previous.get('workspace_id')
     base = ['multica', *(['--profile', profile] if profile else []),
             *(['--workspace-id', workspace] if workspace else [])]
-    daemon = json.loads(run([*base, 'daemon', 'status', '--output', 'json'],
-                            text=True, capture_output=True).stdout)
-    require(daemon.get('status') == 'running', '本机 Multica daemon 尚未运行')
-    pid = int(daemon['pid'])
+    # Multica output shapes change between releases; parse through the shared normalizers.
+    shapes = runpy.run_path(str(ROOT / 'gbb-multica-agent'))
+    daemon = shapes['multica_daemon'](multica_json(shapes, base, 'daemon', 'status'))
+    require(daemon['status'] == 'running', '本机 Multica daemon 尚未运行')
+    pid = require(shapes['multica_int'](daemon['pid']), 'daemon status 未返回 PID，无法核实进程归属')
     require(pid > 0, 'daemon PID 无效，无法核实进程归属')
     daemon_uid = int(run(['ps', '-o', 'uid=', '-p', str(pid)], text=True, capture_output=True).stdout.strip())
     require(daemon_uid == os.geteuid(),
             '当前用户不是 daemon 的系统用户；停止安装，请换到正确账号')
-    current = json.loads(run([*base, 'workspace', 'get', '--output', 'json'],
-                             text=True, capture_output=True).stdout)
+    current = shapes['multica_object'](multica_json(shapes, base, 'workspace', 'get'), 'workspace get', ('workspace',))
     workspace = current['id']
-    require(any(w.get('id') == workspace for w in daemon.get('workspaces', [])),
+    require(workspace in daemon['workspace_ids'],
             '目标工作区未关联到本机 daemon；先检查登录配置及 daemon')
     route = safe_name(args.reply_route or previous.get('reply_route') or instance)
     agent = args.agent_name or previous.get('agent_name') or 'Grok Bot Bridge · ' + instance
