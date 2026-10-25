@@ -1,63 +1,61 @@
 #!/usr/bin/env bash
 # 回传端一键恢复：Grok Bot 电脑被清空/重装后，复用 install.sh 重建 SSH 连接与回填路由。
 # 不改运行端、不碰 webhook URL/key、不发送 Grok 请求；可重复执行。
-#
-# 默认值对应 lthero 的生产部署（root@152.53.141.33，路由 server-root，Bot gbb）；
-# 其他部署用参数覆盖，参数说明见 --help。
+# 本脚本不内置任何部署的主机、用户或指纹：必须通过参数传入（建议由私有包装脚本传参）。
 set -euo pipefail
 
-# ---- 部署默认值（可用参数覆盖） ----
-HOST=152.53.141.33
-SSH_USER=root
+HOST=""
+SSH_USER=""
 PORT=22
-ALIAS=multica-server
-ROUTE=server-root
-INSTANCE=server-root
-BOT=gbb
-KEY="$HOME/.ssh/id_ed25519"
-ENDPOINT=/root/.local/bin/gbb-multica-endpoint
-# 运行端 ED25519 主机指纹；known_hosts 缺失时用它核对 ssh-keyscan 结果。空值=交给 SSH 交互确认。
-HOST_KEY_SHA256='SHA256:GT6s3rTlqp6/PrjLIRn0oLLyf4JyxY1XkvVWx+eMJOE'
+ROUTE=""
+ALIAS=""        # 默认 multica-<route>
+INSTANCE=""     # 默认交给 install.sh（等于 route）
+BOT=""          # 默认交给 install.sh
+KEY=""          # 默认 ~/.ssh/gbb_multica_<alias>_ed25519（与 install.sh 一致）
+ENDPOINT=""     # 默认由 install.sh 在运行端自动发现
+HOST_KEY_SHA256=""
 REPO_URL=https://github.com/lthero-big/gbb-multica-bridge.git
 REPO_DIR=""
 REF=main
 MODE=restore   # restore | check | dry-run
 
 usage() {
-  cat <<USAGE
-用法：bash scripts/restore-reply.sh [选项]
-      bash <(curl -fsSL https://raw.githubusercontent.com/lthero-big/gbb-multica-bridge/main/scripts/restore-reply.sh) [选项]
+  cat <<'USAGE'
+用法：bash scripts/restore-reply.sh --ssh-host HOST --ssh-user USER --route ROUTE [选项]
+      bash <(curl -fsSL https://raw.githubusercontent.com/lthero-big/gbb-multica-bridge/main/scripts/restore-reply.sh) \
+        --ssh-host YOUR_HOST --ssh-user YOUR_USER --route YOUR_ROUTE [选项]
 
 在回传端（Grok Bot 所在电脑）恢复 gbb-multica 回填助手、SSH 连接和路由。
 步骤：取得仓库 → 核对主机指纹 → install.sh ssh（已可用则复用）→ install.sh reply → 检查。
 
-选项（括号内为默认值）：
-  --ssh-host HOST        运行端主机 ($HOST)
-  --ssh-user USER        运行端 daemon 用户 ($SSH_USER)
-  --ssh-port PORT        SSH 端口 ($PORT)
-  --ssh-alias NAME       SSH 连接别名 ($ALIAS)
-  --ssh-key PATH         本机私钥 ($KEY)
-  --route NAME           回填路由 ($ROUTE)
-  --instance-id ID       运行端实例 ($INSTANCE)
-  --bot NAME             Bot 标注 ($BOT)
-  --endpoint PATH        运行端 endpoint ($ENDPOINT)
-  --host-key-sha256 FP   运行端 ED25519 主机指纹；传空串则改为交互确认
-  --repo-url URL         仓库地址 ($REPO_URL)
+必填：
+  --ssh-host HOST        运行端主机域名/IP
+  --ssh-user USER        运行端 Multica daemon 用户
+  --route NAME           回填路由（与运行端 reply-route 一致）
+
+可选：
+  --ssh-port PORT        SSH 端口（22）
+  --ssh-alias NAME       SSH 连接别名（multica-<route>）
+  --ssh-key PATH         本机私钥（~/.ssh/gbb_multica_<alias>_ed25519）
+  --instance-id ID       运行端实例（install.sh 默认：等于 route）
+  --bot NAME             Bot 标注（install.sh 默认）
+  --endpoint PATH        运行端 endpoint 绝对路径（默认自动发现）
+  --host-key-sha256 FP   运行端主机密钥指纹（SHA256:...）；known_hosts 缺该主机时用来核对 ssh-keyscan
+  --repo-url URL         仓库地址
   --repo-dir DIR         仓库目录；默认用脚本所在仓库，否则 ~/.local/share/gbb-multica-bridge/repo
-  --ref REF              克隆/更新的分支 ($REF)
-  --check                只做只读检查（install.sh reply --check + 助手 check）
+  --ref REF              克隆/更新的分支（main）
+  --check                只做只读检查（install.sh reply --check + 助手 check）；只需 --route
   --dry-run              只打印将执行的命令，不连接、不写文件
   -h, --help             显示本帮助
 
-新电脑没有已授权的私钥时，脚本会生成密钥并打印公钥及授权命令后退出（退出码 3）；
-授权后重跑即可。不会读取、传输或保存任何密码、webhook URL/key。
+新电脑没有已授权的私钥时，非交互运行会生成私钥、打印公钥和授权命令后退出（退出码 3）；授权后重跑。
+不会读取、传输或保存任何密码、webhook URL/key。
 USAGE
 }
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf '恢复停止：%s\n' "$*" >&2; exit "${2:-1}"; }
 show() { printf '    $'; printf ' %q' "$@"; printf '\n'; }
-# 执行或在 --dry-run 下只打印
 act() { show "$@"; [[ $MODE == dry-run ]] || "$@"; }
 
 parse_args() {
@@ -72,7 +70,7 @@ parse_args() {
       --instance-id) INSTANCE=${2:?}; shift ;;
       --bot) BOT=${2:?}; shift ;;
       --endpoint) ENDPOINT=${2:?}; shift ;;
-      --host-key-sha256) HOST_KEY_SHA256=${2-}; shift ;;
+      --host-key-sha256) HOST_KEY_SHA256=${2:?}; shift ;;
       --repo-url) REPO_URL=${2:?}; shift ;;
       --repo-dir) REPO_DIR=${2:?}; shift ;;
       --ref) REF=${2:?}; shift ;;
@@ -83,7 +81,20 @@ parse_args() {
     esac
     shift
   done
+  local missing=()
+  [[ -n $ROUTE ]] || missing+=(--route)
+  if [[ $MODE != check ]]; then
+    [[ -n $HOST ]] || missing+=(--ssh-host)
+    [[ -n $SSH_USER ]] || missing+=(--ssh-user)
+  fi
+  if ((${#missing[@]})); then
+    usage >&2
+    die "缺少必填参数：${missing[*]}（本脚本不内置任何部署的主机或用户）" 2
+  fi
   [[ $PORT =~ ^[0-9]+$ ]] || die "--ssh-port 必须是数字" 2
+  ALIAS=${ALIAS:-multica-$ROUTE}
+  KEY=${KEY:-$HOME/.ssh/gbb_multica_${ALIAS}_ed25519}
+  KEY=${KEY/#\~\//$HOME/}   # 允许传入带引号的 ~/...
 }
 
 # 1. 仓库：脚本在仓库内就直接用；否则克隆/快进更新到 REPO_DIR
@@ -98,7 +109,7 @@ locate_repo() {
   REPO_DIR=${REPO_DIR:-$HOME/.local/share/gbb-multica-bridge/repo}
   command -v git >/dev/null || die "需要 git 来获取仓库"
   if [[ -d $REPO_DIR/.git ]]; then
-    log "更新仓库：$REPO_DIR"
+    log "更新仓库：$REPO_DIR（$REF）"
     act git -C "$REPO_DIR" fetch --quiet origin "$REF"
     act git -C "$REPO_DIR" checkout --quiet "$REF"
     act git -C "$REPO_DIR" merge --quiet --ff-only "origin/$REF"
@@ -111,24 +122,24 @@ locate_repo() {
 
 install_sh() { act bash "$REPO_DIR/install.sh" "$@"; }
 
-# 2. known_hosts 缺少运行端时，用固定指纹核对 ssh-keyscan 结果后写入
+# 2. known_hosts 缺少运行端时：有指纹就核对后写入；否则交互终端交给 SSH 确认，非交互停止
 ensure_host_key() {
   local known="$HOME/.ssh/known_hosts" name="$HOST" scanned fp
   [[ $PORT == 22 ]] || name="[$HOST]:$PORT"
   if [[ -f $known ]] && ssh-keygen -F "$name" -f "$known" >/dev/null 2>&1; then
-    log "known_hosts 已有 $name，复用"
+    log "known_hosts 已有该主机，复用"
     return
   fi
   if [[ -z $HOST_KEY_SHA256 ]]; then
-    log "known_hosts 没有 $name，且未指定指纹；稍后由 SSH 交互确认"
-    return
+    [[ $MODE == dry-run || -t 0 ]] && { log "known_hosts 没有该主机；稍后由 SSH 交互确认指纹"; return; }
+    die "known_hosts 没有 $name。请在运行端执行 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 取得指纹，用 --host-key-sha256 传入后重跑"
   fi
-  log "known_hosts 没有 $name，按指纹 $HOST_KEY_SHA256 核对后写入"
+  log "known_hosts 没有该主机，按 --host-key-sha256 核对后写入"
   [[ $MODE == dry-run ]] && { show ssh-keyscan -t ed25519 -p "$PORT" "$HOST"; return; }
   scanned=$(ssh-keyscan -T 10 -t ed25519 -p "$PORT" "$HOST" 2>/dev/null) || true
   [[ -n $scanned ]] || die "ssh-keyscan 取不到 $HOST 的 ED25519 主机密钥"
   fp=$(ssh-keygen -lf - <<<"$scanned" | awk '{print $2}')
-  [[ $fp == "$HOST_KEY_SHA256" ]] || die "主机指纹不符：期望 $HOST_KEY_SHA256，实际 $fp。未写入 known_hosts；确认服务器是否重装后用 --host-key-sha256 指定"
+  [[ $fp == "$HOST_KEY_SHA256" ]] || die "主机指纹不符：期望 $HOST_KEY_SHA256，实际 $fp。未写入 known_hosts"
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
   (umask 077; printf '%s\n' "$scanned" >>"$known")
 }
@@ -149,13 +160,13 @@ print_authorize_help() {
   pub=$(ssh-keygen -y -f "$KEY" | cut -d' ' -f1,2)
   cat <<HELP
 
-本机私钥 $KEY 还没有被 $SSH_USER@$HOST 授权。复制下面的公钥，在任意一台能登录该服务器的电脑上执行其一：
+本机私钥 $KEY 还没有被运行端授权。在任意一台能登录运行端的电脑上执行其一：
 
-  ssh $SSH_USER@$HOST 'bash /root/restore-gbb-reply.sh authorize "$pub gbb-multica:$ALIAS"'
-  # 或：ssh $SSH_USER@$HOST 'umask 077; mkdir -p ~/.ssh; echo "$pub gbb-multica:$ALIAS" >> ~/.ssh/authorized_keys'
+  ssh -p $PORT $SSH_USER@$HOST 'bash /opt/gbb-multica-bridge/scripts/restore-reply-server.sh authorize "$pub gbb-multica:$ALIAS"'
+  # 或：ssh -p $PORT $SSH_USER@$HOST 'umask 077; mkdir -p ~/.ssh; echo "$pub gbb-multica:$ALIAS" >> ~/.ssh/authorized_keys'
 
-或者在本机交互终端重跑本脚本，按 SSH 提示输入一次服务器密码（ssh-copy-id 也可以）。
-授权后用同样的方式重跑本脚本（脚本会复用这把私钥）。
+（运行端仓库不在 /opt/gbb-multica-bridge 时换成实际路径。）也可以在本机交互终端重跑本脚本，按 SSH 提示输入一次密码。
+授权后用同样的参数重跑本脚本（会复用这把私钥）。
 HELP
 }
 
@@ -173,14 +184,9 @@ ensure_ssh() {
     fi
     key_authorized || { print_authorize_help; exit 3; }
   fi
-  log "配置 SSH 连接 $ALIAS → $SSH_USER@$HOST:$PORT"
+  log "配置 SSH 连接 $ALIAS"
   install_sh ssh --ssh-alias "$ALIAS" --ssh-host "$HOST" --ssh-user "$SSH_USER" \
              --ssh-port "$PORT" --ssh-key "$KEY"
-}
-
-reply_args() {
-  printf '%s\0' --route "$ROUTE" --instance-id "$INSTANCE" --bot "$BOT" \
-                --transport ssh --ssh-alias "$ALIAS" --endpoint "$ENDPOINT"
 }
 
 run_checks() {
@@ -201,15 +207,17 @@ main() {
     ensure_host_key
     ensure_ssh
     log "安装回填助手并写入路由 $ROUTE（复用已有配置）"
-    local args=()
-    mapfile -d '' args < <(reply_args)
+    local args=(--route "$ROUTE" --transport ssh --ssh-alias "$ALIAS")
+    [[ -n $INSTANCE ]] && args+=(--instance-id "$INSTANCE")
+    [[ -n $BOT ]] && args+=(--bot "$BOT")
+    [[ -n $ENDPOINT ]] && args+=(--endpoint "$ENDPOINT")
     install_sh reply "${args[@]}"
   fi
   run_checks
   [[ $MODE == dry-run ]] && { log "dry-run 结束；SSH 已可用时实际运行会跳过 install.sh ssh"; return; }
   cat <<DONE
 
-回传端已就绪：路由 $ROUTE → $ALIAS ($SSH_USER@$HOST)，助手 $HOME/.local/bin/gbb-multica-remote。
+回传端已就绪：路由 $ROUTE → $ALIAS，助手 $HOME/.local/bin/gbb-multica-remote。
 下一步：
   1. 确认 Grok Bot 的「Multica bridge」例程说明里的助手路径仍是 $HOME/.local/bin/gbb-multica-remote、
      路由仍是 $ROUTE（完整提示词：\${GBB_MULTICA_CONFIG_HOME:-~/.config/gbb-multica}/grok-bot-prompt.md）。

@@ -270,24 +270,27 @@ GBB_REPLY
 
 回传端（`gbb-multica-remote`、`~/.config/gbb-multica` 路由、SSH 专用配置）只存在于 Grok Bot 电脑上；那台电脑关机重置或被清空后要重装。运行端、Multica Agent 和 Grok Bot 的 webhook 例程都不受影响，**不需要**重配 URL/key。
 
-在被清空的 Grok Bot 电脑上执行（脚本默认值对应本仓库作者的部署：`root@152.53.141.33`、路由/实例 `server-root`、Bot `gbb`、SSH 别名 `multica-server`、私钥 `~/.ssh/id_ed25519`）：
+脚本不内置任何主机、用户或指纹，必须手动传入。在被清空的 Grok Bot 电脑上执行：
 
 ```bash
 # 仓库已在本机
-bash scripts/restore-reply.sh
+bash scripts/restore-reply.sh --ssh-host YOUR_HOST --ssh-user YOUR_USER --route YOUR_ROUTE \
+  --host-key-sha256 SHA256:YOUR_HOST_KEY_FINGERPRINT
 # 或直接从 GitHub 取（会克隆到 ~/.local/share/gbb-multica-bridge/repo）
-bash <(curl -fsSL https://raw.githubusercontent.com/lthero-big/gbb-multica-bridge/main/scripts/restore-reply.sh)
-# 本机已能免密登录服务器时，也可用服务器上的副本
-bash <(ssh root@152.53.141.33 cat /opt/gbb-multica-bridge/scripts/restore-reply.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lthero-big/gbb-multica-bridge/main/scripts/restore-reply.sh) \
+  --ssh-host YOUR_HOST --ssh-user YOUR_USER --route YOUR_ROUTE --host-key-sha256 SHA256:YOUR_HOST_KEY_FINGERPRINT
 ```
 
-脚本只调用现有入口：核对运行端主机指纹（`known_hosts` 缺失时用 `--host-key-sha256` 指定的值校验 `ssh-keyscan` 结果）→ `install.sh ssh`（连接已可用则跳过）→ `install.sh reply --route … --transport ssh --ssh-alias … --endpoint …` → `install.sh reply --route … --check` 与 `gbb-multica-remote check …`。可重复执行；不改运行端、不发 Grok 请求。
+- 必填：`--ssh-host`、`--ssh-user`（运行端 daemon 用户）、`--route`（与运行端 reply-route 一致）。缺少时打印用法并以退出码 2 停止。
+- 可选：`--ssh-port`、`--ssh-alias`（默认 `multica-<route>`）、`--ssh-key`（默认 `~/.ssh/gbb_multica_<alias>_ed25519`）、`--instance-id`、`--bot`、`--endpoint`（默认自动发现）。原安装用过的别名、私钥路径、实例名和 Bot 应原样传入，以生成相同的路由和提示词。
+- `--host-key-sha256`：`known_hosts` 里没有运行端时，用它核对 `ssh-keyscan` 的 ED25519 主机密钥，不符则停止。在运行端执行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 可得到它。不传时，交互终端交给 SSH 确认指纹，非交互运行直接停止。
+- `--check` 只做只读检查（只需 `--route`），`--dry-run` 只打印要执行的命令。
 
-- 其他部署用参数覆盖：`--ssh-host --ssh-user --ssh-port --ssh-alias --ssh-key --route --instance-id --bot --endpoint`，详见 `--help`。
-- `--check` 只做只读检查，`--dry-run` 只打印要执行的命令。
-- 新电脑没有已授权的私钥时，非交互环境下脚本会生成 `--ssh-key`、打印公钥和授权命令后退出（退出码 3）。在任意能登录服务器的电脑上执行打印出的 `ssh root@… 'bash /root/restore-gbb-reply.sh authorize "<公钥>"'`（或 `ssh-copy-id`），再重跑脚本。在交互终端运行时也可以直接按 SSH 提示输入一次服务器密码。
+脚本只调用现有入口：核对主机指纹 → `install.sh ssh`（连接已可用则跳过）→ `install.sh reply --route … --transport ssh --ssh-alias …` → `install.sh reply --route … --check` 与 `gbb-multica-remote check …`。可重复执行；不改运行端、不发 Grok 请求。
 
-运行端服务器上的 `/root/restore-gbb-reply.sh` 链接到 `scripts/restore-reply-server.sh`：不带参数显示上述命令，`authorize '<公钥>'` 幂等追加公钥，`update` 快进更新 `/opt/gbb-multica-bridge`。
+新电脑没有已授权的私钥时，非交互运行会生成 `--ssh-key`、打印公钥和授权命令后退出（退出码 3）。在任意能登录运行端的电脑上执行打印出的 `ssh … 'bash /opt/gbb-multica-bridge/scripts/restore-reply-server.sh authorize "<公钥>"'`（或 `ssh-copy-id`），再用同样的参数重跑。
+
+运行端上的 `scripts/restore-reply-server.sh`：不带参数显示恢复命令模板和本机主机指纹，`authorize '<公钥>'` 幂等追加公钥，`update` 快进更新仓库副本。若想在自己的服务器上保留“填好真实参数”的一键命令，请写一个**不提交到仓库**的私有包装脚本（例如 `~/restore-gbb-reply.sh`），由它把主机、用户、指纹等作为参数传给公开脚本。
 
 恢复完成后，确认 Grok Bot 的 Multica bridge 例程说明里的助手路径（`~/.local/bin/gbb-multica-remote` 的绝对路径）和路由不变，再在 Multica 新聊天发送“请只回复 `GBB_RUNTIME_OK`”验证。
 

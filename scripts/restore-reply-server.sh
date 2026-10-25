@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# 运行端（Multica daemon 所在服务器）上的回传端恢复入口；安装为 /root/restore-gbb-reply.sh 的符号链接。
-# 回传端在 Grok Bot 电脑上，本脚本只负责：说明恢复命令、授权新回传端公钥、更新仓库副本。
-# 不改运行端配置、不碰 webhook、不发送 Grok 请求。
+# 运行端（Multica daemon 所在服务器）上的辅助入口：显示回传端恢复命令、授权新回传端公钥、更新仓库副本。
+# 回传端在 Grok Bot 电脑上，本脚本不在服务器上恢复任何东西；不改运行端配置、不碰 webhook、不发送 Grok 请求。
+# 不含任何部署信息；需要真实主机/用户/指纹的一键命令请放在服务器上的私有包装脚本里，不要提交到仓库。
 set -euo pipefail
 REPO_DIR=${GBB_REPO_DIR:-/opt/gbb-multica-bridge}
 RESTORE="$REPO_DIR/scripts/restore-reply.sh"
 RAW=https://raw.githubusercontent.com/lthero-big/gbb-multica-bridge/main/scripts/restore-reply.sh
 
 usage() {
-  local host=${GBB_PUBLIC_HOST:-152.53.141.33}
   cat <<USAGE
 gbb-multica 回传端一键恢复（在被清空的 Grok Bot 电脑上执行，而不是在这台服务器上）：
 
-  # 新电脑还没有登录本服务器的私钥：从 GitHub 获取并运行
-  bash <(curl -fsSL $RAW)
+  bash <(curl -fsSL $RAW) \\
+    --ssh-host YOUR_HOST --ssh-user YOUR_USER --route YOUR_ROUTE \\
+    --host-key-sha256 "\$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print \$2}')"   # 在本服务器上求值
 
-  # 新电脑已能免密 SSH 到本服务器：直接用这里的副本
-  bash <(ssh $(id -un)@$host cat $RESTORE)
+本服务器 ED25519 主机指纹（核对用）：
+  $(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $2}' || echo '（读取失败）')
 
-若脚本提示私钥未授权（退出码 3），把它打印的公钥在本服务器授权后重跑：
-  bash $0 authorize 'ssh-ed25519 AAAA... gbb-multica:multica-server'
+若恢复脚本提示私钥未授权（退出码 3），把它打印的公钥在本服务器授权后重跑：
+  bash $0 authorize 'ssh-ed25519 AAAA... gbb-multica:ALIAS'
 
 其他子命令：
   bash $0 update   # 快进更新 $REPO_DIR（不重装运行端）
