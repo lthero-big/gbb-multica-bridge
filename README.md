@@ -37,6 +37,7 @@ bash install.sh runtime --interactive  # 运行端向导
 bash install.sh reply --interactive    # 回传端向导
 bash install.sh ssh                    # 独立 SSH 免密配置
 bash install.sh --help                 # 命令行参数
+bash scripts/restore-reply.sh          # 回传端一键恢复（Grok Bot 电脑被清空后）
 ```
 
 同机同用户选择**本机直连**；跨机器或不同用户选择 **SSH**，同机不同用户可连接 `localhost`。SSH 配置可以单独完成，再由回传端复用。
@@ -54,6 +55,7 @@ bash install.sh local --instance-id host-alice --bot bridge
 ## 文档
 
 - [安装、参数与部署示例](docs/installation.md)：SSH、同机/跨机、多用户、升级和检查。
+- [回传端一键恢复](docs/installation.md#回传端一键恢复)：Grok Bot 电脑被清空后重建回填助手和路由。
 - [Grok Bot 运行提示词模板](docs/grok-bot-prompt.md)：由脚本填入配置后在终端显示。
 - [工具协议](docs/tool-protocol.md)：Multica 查询、创建、编辑及手动回填。
 - [gbb 0.2.0 来源与校验](vendor/README.md)：随附归档来自已验证的本机安装，不是 npm 官方发布归档。
