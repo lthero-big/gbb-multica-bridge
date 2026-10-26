@@ -1012,6 +1012,8 @@ def main():
 
     runtime = local_runtime()
     needs = []
+    if cfg.get("maxPerHour", 12) == 12:
+        needs.append("将 gbb 默认发送限额更新为 120 条/小时")
     if not wrapper_ok:
         needs.append("安装/更新包装")
     if not profile or not profile.get("enabled", True):
@@ -1044,6 +1046,29 @@ def main():
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SetupError("同机已有配置脚本在运行，请等待其结束。") from None
+
+    # gbb 0.2.0 defaults to 12/h; tool rounds also consume this per-Bot limit.
+    # Re-read after the guards/lock, and preserve limits explicitly set to other values.
+    config_path = gbb_home / "config.json"
+    cfg = read_object(config_path, "gbb 配置")
+    if cfg.get("maxPerHour", 12) == 12:
+        require(not config_path.is_symlink(), f"拒绝覆盖符号链接：{config_path}")
+        backup = config_path.with_name(config_path.name + f".bak-{time.time_ns()}")
+        shutil.copy2(config_path, backup)
+        backup.chmod(0o600)
+        cfg["maxPerHour"] = 120
+        fd, temp_name = tempfile.mkstemp(prefix=".gbb-config-", dir=gbb_home)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(cfg, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                os.fchmod(stream.fileno(), 0o600)
+            os.replace(temp_name, config_path)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
+        print(f"gbb 发送限额已设为 120 条/小时；原配置已备份：{backup}")
+    else:
+        print("保留已有 gbb 自定义发送限额。")
 
     if not wrapper_ok:
         bin_dir.mkdir(parents=True, exist_ok=True)

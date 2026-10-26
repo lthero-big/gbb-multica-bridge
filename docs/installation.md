@@ -255,6 +255,8 @@ bash install.sh ssh --dry-run
 
 升级时 `git pull` 后重跑安装向导或原命令。已有资源复用，变更的配置文件先备份；不会自动发测试消息。`runtime --check` 返回 2 表示 Multica 配置尚需修正，其他非零状态表示检查/权限/连接失败。
 
+`local` / `runtime` 安装及独立 `gbb-multica-setup.sh` 会将当前 `GBB_HOME/config.json` 中未设置或仍为旧默认 `12` 的 `maxPerHour` 更新为 `120`，先备份原配置，保留其他字段和不同数值的自定义限额。`--check` 仅提示需要更新，不修改配置。gbb 每次发送都会读取配置，无需重启；此限额按 Bot 统计最近一小时的发送次数，工具回合也占次数。单独安装上游 gbb 0.2.0 的默认值仍为 `12`，须完成本项目运行端配置才会更新。遇到 `notify.log` 的 `skip: rate limit …` 时先检查该限额与原 inbox，不要自动重发已失败的任务。
+
 先手动验证也可以：在运行端同一用户、同一 GBB_HOME 下查询 inbox，并对**本轮新消息**回填：
 
 ```bash

@@ -118,11 +118,14 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
         state_path = root / "state.json"
         # Deliberately give fake commands no real Multica identity or webhook env.
         env = {"PATH":f"{fake_bin}:/usr/bin:/bin", "LANG":"C.UTF-8", "FAKE_MULTICA_STATE":str(state_path)}
-        def reset(**changes):
+        def reset(rate_limit=120, **changes):
             state = {"daemon_pid":os.getpid(),"calls":[],"writes":[],"profiles":[],"agents":[],"env":{}}
             state.update(changes)
             state_path.write_text(json.dumps(state))
-            (home / "config.json").write_text(json.dumps({"defaultBot":"bridge","hubBot":"bridge"}))
+            config = {"defaultBot":"bridge","hubBot":"bridge","allowedRoots":["~/projects"]}
+            if rate_limit is not None:
+                config["maxPerHour"] = rate_limit
+            (home / "config.json").write_text(json.dumps(config))
             (home / "credentials.json").write_text(json.dumps({"bridge":{"url":"https://example.invalid/webhook","key":"DO_NOT_PRINT_FAKE_KEY"}}))
         def state(): return json.loads(state_path.read_text())
         def run(*args, task=False):
@@ -138,10 +141,20 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
         agent={"id":"test-agent","name":"Grok Bot Bridge 测试","runtime_id":"foreign-runtime",
                "model":"unsupported-model","custom_args":["--unsupported"],"max_concurrent_tasks":6}
         try:
-            reset()
+            reset(rate_limit=None)
+            config_path = home / "config.json"
+            original_config = config_path.read_bytes()
             checked=run("--check")
             assert checked.returncode==2 and state()["writes"]==[] and not install_dir.exists()
+            assert "120 条/小时" in checked.stdout
+            assert config_path.read_bytes() == original_config and not list(home.glob("config.json.bak-*"))
             passed(run())
+            expected_config = {**json.loads(original_config), "maxPerHour":120}
+            assert json.loads(config_path.read_text()) == expected_config
+            assert config_path.stat().st_mode & 0o777 == 0o600
+            backups = list(home.glob("config.json.bak-*"))
+            assert len(backups) == 1 and backups[0].read_bytes() == original_config
+            assert backups[0].stat().st_mode & 0o777 == 0o600
             first=state()
             assert first["writes"].count("profile.create")==1 and first["writes"].count("agent.create")==1
             assert first["agents"][0]["runtime_id"]=="local-runtime", "must ignore the foreign runtime even when it appears first"
@@ -151,10 +164,28 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             version=subprocess.run([str(wrapper),"--version"],env=env,capture_output=True,text=True,check=True)
             assert version.stdout.strip()=="gbb-multica-agent 0.4.0"
             passed(run())
+            assert list(home.glob("config.json.bak-*")) == backups, "reinstall must not rewrite an updated limit"
             second=state()
             assert second["writes"].count("profile.create")==1 and second["writes"].count("agent.create")==1
             assert "agent.update" not in second["writes"] and "env.set" not in second["writes"]
             passed(run("--check"))
+
+            # Upgrade the old default; keep deliberate custom limits, including lower ones.
+            for limit in (12, 240, 6):
+                original_config = json.dumps({**expected_config, "maxPerHour":limit}).encode()
+                config_path.write_bytes(original_config)
+                before_backups = set(home.glob("config.json.bak-*"))
+                checked = run("--check")
+                assert checked.returncode == (2 if limit == 12 else 0), (checked.stdout, checked.stderr)
+                assert config_path.read_bytes() == original_config
+                assert set(home.glob("config.json.bak-*")) == before_backups
+                passed(run())
+                assert json.loads(config_path.read_text()) == {**expected_config, "maxPerHour":120 if limit == 12 else limit}
+                added = set(home.glob("config.json.bak-*")) - before_backups
+                assert len(added) == (1 if limit == 12 else 0)
+                assert not added or next(iter(added)).read_bytes() == original_config
+                passed(run("--check"))
+            assert not (home / "messages").exists() and not (home / "notify.log").exists()
 
             reset()
             passed(run('--profile', 'alice', '--instance-id', 'linux-alice', '--reply-route', 'alice'))
@@ -186,8 +217,10 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             reset()
             (home/"credentials.json").unlink()
             assert run().returncode==1 and state()["writes"]==[]
-            reset(profiles=[profile.copy()],agents=[agent.copy()],runs=[{"status":"running"}])
+            reset(rate_limit=12, profiles=[profile.copy()],agents=[agent.copy()],runs=[{"status":"running"}])
+            before_config = config_path.read_bytes()
             assert run().returncode==1 and state()["writes"]==[]
+            assert config_path.read_bytes() == before_config, "active-task guard must precede rate-limit migration"
 
             reset(daemon_pid=0)
             assert run().returncode==1 and state()["writes"]==[]
