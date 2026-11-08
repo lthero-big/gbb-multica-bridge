@@ -10,6 +10,7 @@ Each run is woken by grok-bot-bridge on my computer. The request body is JSON wi
 Routing: if "to" names another Bot, you are the hub. Talk to that Bot to get it done, and relay what it says. If "to" is empty or is you, handle it yourself.
 
 Events:
+- Before handling an ask, read its complete local message with `{{REMOTE_HELPER_COMMAND}} inbox <reply_route> <message_id>`. Webhook views may truncate summary; use the matching message JSON's full `question`, including GBB_TOOL_PROTOCOL_V1 and REQUEST_JSON. Exit code 2 with a valid matching message means pending answer and is normal; stop for other errors or mismatched IDs. Do not infer a task from a truncated webhook.
 - ask: someone on my computer (me or a local agent like Claude Code) is waiting in a terminal for an answer. Get the answer (ask the Bot named in "to" if it's another Bot), then deliver it by running this on my computer:
   ```bash
   {{REMOTE_HELPER_COMMAND}} answer <reply_route> <message_id> - <<'EOF'

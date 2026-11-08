@@ -120,12 +120,18 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
   const reply = req.route
     ? `gbb-multica-remote answer ${req.route} ${msg.id} -`
     : `gbb answer ${msg.id} -`;
-  const payload = buildPayload('ask', req.prompt, {
+  const built = buildPayload('ask', req.prompt, {
     to: req.target, message_id: msg.id, cwd: process.cwd(),
     agent: 'gbb-multica-agent',
     bridge_instance: req.instance, reply_route: req.route,
     next: [`${reply} <<'EOF'\n<answer>\nEOF`]
   }, req.prompt.length);
+  // Webhook viewers can truncate long bodies: put routing first and send the
+  // complete task once, rather than duplicating it in both summary and text.
+  const {summary, text: duplicatedText, ...routing} = built;
+  const payload = {...routing,
+    text: `Multica task; full instructions in summary.\nbridge_instance: ${req.instance}\nreply_route: ${req.route}\nmessage_id: ${msg.id}\nNext: ${reply}`,
+    summary};
   stage = 'webhook-send';
   const sent = await send(payload, {bot: hub, force: true});
   if (!sent.ok) { console.error(`GBB send failed (${sent.status || 'unavailable'}); inspect original inbox message; no retry`); process.exitCode = 1; return; }

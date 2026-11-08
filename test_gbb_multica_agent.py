@@ -14,11 +14,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def check():
     wrapper = str(Path(__file__).with_name("gbb-multica-agent").resolve())
+    endpoint = str(Path(__file__).with_name("gbb-multica-endpoint").resolve())
     answer = 'GBB_RUNTIME_OK\n中文，多行；保留 "引号"、$HOME 和 `字面量`。'
     prompt = '运行时连通性测试\n' + ('长任务 "quotes" $HOME `literal`\n' * 2000)
     with tempfile.TemporaryDirectory(prefix="gbb-offline-") as tmp:
         env = dict(os.environ, GBB_HOME=tmp, GBB_TARGET_BOT="bridge",
-                   GBB_INSTANCE_ID="linux-alice", GBB_REPLY_ROUTE="alice")
+                   GBB_INSTANCE_ID="linux-alice", GBB_REPLY_ROUTE="alice", GBB_MULTICA_CONFIG_HOME=tmp)
+        Path(tmp, 'server.json').write_text(json.dumps({
+            'instance_id': 'linux-alice', 'gbb_home': tmp, 'node_bin': sys.executable,
+        }))
         for key in ("GBB_WEBHOOK_URL", "GBB_WEBHOOK_KEY", "GBB_WAIT"):
             env.pop(key, None)
         seen, mode = [], ["answer"]
@@ -37,6 +41,16 @@ def check():
                 self.end_headers()
                 received.set()
                 if mode[0] == "answer":
+                    pending = subprocess.run(
+                        [sys.executable, endpoint, "--instance-id", "linux-alice", "inbox", payload["message_id"]],
+                        capture_output=True, text=True, env=env, timeout=5,
+                    )
+                    if pending.returncode != 2:
+                        errors.append("inbox must return 2 while waiting for an answer")
+                    else:
+                        message = json.loads(pending.stdout)
+                        if message["id"] != payload["message_id"] or message["question"] != payload["summary"]:
+                            errors.append("inbox must preserve the matching message's complete question")
                     reply = subprocess.run(
                         ["/usr/bin/gbb", "answer", payload["message_id"], "-"],
                         input=answer, capture_output=True, text=True, env=env, timeout=5,
@@ -83,12 +97,23 @@ def check():
             assert seen[0]['bridge_instance'] == 'linux-alice' and seen[0]['reply_route'] == 'alice'
             assert f'gbb-multica-remote answer alice {seen[0]["message_id"]} -' in seen[0]['next'][0]
             assert request['reply_route'] == 'alice'
+            keys = list(seen[0])
+            assert all(keys.index(key) < keys.index('summary') for key in
+                       ('message_id', 'bridge_instance', 'reply_route', 'next')), 'routing must precede long task text'
+            assert len(seen[0]['text']) < 1000, 'text must not duplicate the full task'
+            assert prompt not in seen[0]['text']
             assert os.environ.get("MULTICA_TOKEN", "no-token-sentinel") not in seen[0]["summary"]
             assert [e["data"]["deltaContent"] for e in stream if e["type"] == "assistant.message_delta"] == [answer]
             assert [e["data"]["content"] for e in stream if e["type"] == "assistant.message"] == [answer]
             assert stream[-1] == {"type": "result", "exitCode": 0}
             assert all("sessionId" not in e and "sessionId" not in e.get("data", {}) for e in stream)
             assert not errors, errors
+            answered = subprocess.run(
+                [sys.executable, endpoint, '--instance-id', 'linux-alice', 'inbox', seen[0]['message_id']],
+                capture_output=True, text=True, env=env, timeout=5,
+            )
+            assert answered.returncode == 0, answered.stderr
+            assert json.loads(answered.stdout)['answer'] == answer
 
             for flag in ("--model", "--resume", "--unknown"):
                 before = len(seen)

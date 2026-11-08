@@ -41,6 +41,14 @@ def main():
         result.update(instance_id=config['instance_id'], user=config['user'], gbb_home=config['gbb_home'])
         print(json.dumps(result, ensure_ascii=False))
         return 0
+    if args.action == 'inbox' and args.message_id:
+        # gbb 0.2.0 exits immediately after console.log; piped large messages
+        # can be cut off before Node flushes stdout. Read the same store here.
+        message = json.loads((Path(config['gbb_home']) / 'messages' / (args.message_id + '.json')).read_text())
+        if not isinstance(message, dict) or message.get('id') != args.message_id:
+            parser.error('stored message ID mismatch')
+        print(json.dumps(message, ensure_ascii=False))
+        return 0 if 'answer' in message else 2
     command = [config['gbb_bin'], args.action]
     if args.message_id:
         command.append(args.message_id)
