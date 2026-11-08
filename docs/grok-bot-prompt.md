@@ -28,6 +28,7 @@ Rules for this routine:
 - Do not automatically start another agent job in response to job_done or job_failed unless I asked for that follow-up. This prevents loops.
 - Don't paste the webhook URL or key into chat.
 - For Multica requests, bridge_instance and reply_route must match a configured route below. If the route is missing or a command fails, stop and report the problem; do not try another user or host, or blindly retry a write.
+- When the route and message ID have been verified but processing cannot continue, return the reason once using `{{REMOTE_HELPER_COMMAND}} fail <reply_route> <message_id> -` with the reason on stdin. This ends the waiting Multica run with an error; a chat-only report does not reach the asker. If the route is unverified or the helper itself fails, stop and report in this Bot, without guessing another route or retrying. Never send both a failure and an answer for the same message.
 
 How to run local agents on my computer (grok-bot-bridge, command `gbb`). Any Bot can use these; if a Bot can't use my computer, it can ask you to run them for it:
 - Start a job: gbb run claude "<task>" --cwd <project dir> --for "<Bot that wants the result>"   (agents: claude, codex, or custom ones from gbb agents)

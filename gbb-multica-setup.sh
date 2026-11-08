@@ -80,7 +80,7 @@ SECRET_FIELDS = re.compile(
     r"^(custom_env|mcp_config|runtime_config|credentials?|password|authorization|"
     r"headers|env|api_key|access_token|refresh_token|webhook_(token|url|path|secret))$", re.I)
 
-# Reuse gbb's store, credentials, rate limiter and answer poller, with an explicit
+# Reuse gbb's store, credentials and rate limiter, with an explicit
 # payload limit. This preserves the complete prompt without changing global config.
 GBB_TRANSPORT = r"""
 const fs = require('node:fs');
@@ -92,11 +92,11 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
   stage = 'gbb-path';
   const base = path.dirname(fs.realpathSync(process.argv[1]));
   const load = name => { stage = 'module-import:' + name; return import(pathToFileURL(path.join(base, name)).href); };
-  const {loadConfig, getCredentials} = await load('config.js');
-  const {newMessage, waitForAnswer} = await load('messages.js');
+  const {loadConfig, getCredentials, homeDir, writeJsonAtomic} = await load('config.js');
+  const {newMessage} = await load('messages.js');
   const {send, buildPayload, VERSION} = await load('webhook.js');
   if (typeof VERSION === 'string' && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(VERSION)) moduleVersion = VERSION;
-  const required = {loadConfig, getCredentials, newMessage, waitForAnswer, send, buildPayload};
+  const required = {loadConfig, getCredentials, homeDir, writeJsonAtomic, newMessage, send, buildPayload};
   const missing = Object.keys(required).filter(name => typeof required[name] !== 'function');
   stage = missing.length ? 'module-api:missing=' + missing.join(',') : 'config-load';
   if (missing.length) throw new Error('GBB module interface unavailable');
@@ -114,6 +114,9 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
   }
   stage = 'message-create';
   const msg = newMessage(req.target, req.prompt, hub);
+  // Keep reply validation independent of truncated webhook views or model output.
+  msg.bridge = {request_id: req.request_id, instance: req.instance, expires_at: req.expires_at};
+  writeJsonAtomic(path.join(homeDir(), 'messages', `${msg.id}.json`), msg);
   messageId = /^[A-Za-z0-9_-]+$/.test(msg.id) ? msg.id : '';
   console.error(`GBB message ${msg.id}; waiting up to ${req.wait}s`);
   stage = 'payload-build';
@@ -136,7 +139,37 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
   const sent = await send(payload, {bot: hub, force: true});
   if (!sent.ok) { console.error(`GBB send failed (${sent.status || 'unavailable'}); inspect original inbox message; no retry`); process.exitCode = 1; return; }
   stage = 'answer-wait';
-  const done = await waitForAnswer(msg.id, req.wait);
+  const done = await new Promise((resolve, reject) => {
+    let watcher, poll, timeout, settled = false;
+    const file = path.join(homeDir(), 'messages', `${msg.id}.json`);
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      watcher?.close();
+      clearInterval(poll);
+      clearTimeout(timeout);
+      error ? reject(error) : resolve(value);
+    };
+    const check = (expired = false) => {
+      if (settled) return;
+      try {
+        const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (value.id !== msg.id) throw new Error('message ID mismatch');
+        if (value.answer !== undefined || expired) finish(null, value);
+      } catch (error) { finish(error); }
+    };
+    // Watch the directory because reply helpers replace the file atomically.
+    // Polling remains a fallback for unavailable watchers and missed notifications.
+    try {
+      watcher = fs.watch(path.dirname(file), (_, name) => {
+        if (name == null || String(name) === path.basename(file)) check();
+      });
+      watcher.on('error', () => { watcher?.close(); watcher = undefined; });
+    } catch (_) { /* The polling fallback still observes replies and timeouts. */ }
+    poll = setInterval(check, 1000);
+    timeout = setTimeout(() => check(true), req.wait * 1000);
+    check(); // Also covers replies that arrived before the watcher was installed.
+  });
   if (done.answer === undefined) { console.error(`GBB timeout: ${msg.id}; inspect before retrying`); process.exitCode = 2; return; }
   process.stdout.write(done.answer);
 })().catch(err => {
@@ -611,6 +644,11 @@ def parse_reply(output, request_id):
         return output.rstrip("\r\n"), None
     if value.get("gbb_tool_protocol") != 1 or value.get("request_id") != request_id:
         raise BridgeError("tool protocol/request_id mismatch; this reply executed no operations")
+    if "error" in value:
+        if (not isinstance(value["error"], str) or not value["error"].strip()
+                or "final" in value or "tool_calls" in value):
+            raise BridgeError("invalid bridge error reply; this reply executed no operations")
+        raise BridgeError("Grok Bot could not complete this request: " + value["error"][:4000])
     if isinstance(value.get("final"), str) and value["final"].strip() and "tool_calls" not in value:
         return value["final"], None
     calls = value.get("tool_calls")
@@ -629,6 +667,49 @@ def transport(request, timeout):
     env = {k: v for k, v in os.environ.items() if not k.startswith("MULTICA_")}
     return child([NODE_BIN, "-e", GBB_TRANSPORT, GBB_BIN], body=json.dumps(request),
                  env=env, timeout=timeout, stderr=None)
+
+
+def bridge_settings():
+    """A newly rebound Agent can use this user's installed route, never a guessed route."""
+    instance, route = (os.environ.get(k, "") for k in ("GBB_INSTANCE_ID", "GBB_REPLY_ROUTE"))
+    if bool(instance) != bool(route):
+        raise BridgeError("GBB_INSTANCE_ID and GBB_REPLY_ROUTE must be configured together; no request sent")
+    config = {}
+    if not instance:
+        root = Path(os.environ.get("GBB_MULTICA_CONFIG_HOME", str(Path.home() / ".config/gbb-multica")))
+        path = root / "server.json"
+        try:
+            config = json.loads(path.read_text())
+        except FileNotFoundError:
+            pass  # Standalone legacy gbb installations have no routed deployment.
+        except (OSError, ValueError):
+            raise BridgeError("cannot read installed bridge server.json; no request sent") from None
+        else:
+            if not config:
+                raise BridgeError("installed bridge configuration is empty; no request sent")
+        if not isinstance(config, dict):
+            raise BridgeError("invalid installed bridge server.json; no request sent")
+        if config:
+            instance, route = config.get("instance_id"), config.get("reply_route")
+            if not instance or not route:
+                raise BridgeError("installed bridge route is incomplete; no request sent")
+            if not isinstance(config.get("gbb_home"), str) or not config["gbb_home"]:
+                raise BridgeError("installed bridge message directory is invalid; no request sent")
+            workspace = os.environ.get("MULTICA_WORKSPACE_ID")
+            if workspace and config.get("workspace_id") != workspace:
+                raise BridgeError("installed bridge belongs to another workspace; configure this Agent explicitly")
+            if os.environ.get("GBB_HOME") and Path(os.environ["GBB_HOME"]).resolve() != Path(config.get("gbb_home", "")).resolve():
+                raise BridgeError("message directory differs from installed reply route; configure this Agent explicitly")
+    for value in (instance, route):
+        if value and (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value)):
+            raise BridgeError("invalid bridge instance/route; no request sent")
+    target = os.environ.get("GBB_TARGET_BOT", config.get("bot", "bridge"))
+    home = os.environ.get("GBB_HOME", config.get("gbb_home", str(Path.home() / ".grok-bot-bridge")))
+    if not isinstance(target, str) or not target.strip() or target.startswith("-"):
+        raise BridgeError("GBB_TARGET_BOT must be a non-empty Bot name, not a flag")
+    if not isinstance(home, str) or not home:
+        raise BridgeError("invalid bridge message directory; no request sent")
+    return target.strip(), instance, route, home
 
 
 def main():
@@ -665,14 +746,11 @@ def main():
         prompt = sys.stdin.read()
     if not prompt or not prompt.strip():
         parser.error("a non-empty -p prompt or stdin is required")
-    target = os.environ.get("GBB_TARGET_BOT", "bridge").strip()
-    if not target or target.startswith("-"):
-        parser.error("GBB_TARGET_BOT must be a non-empty Bot name, not a flag")
-    instance = os.environ.get("GBB_INSTANCE_ID", "")
-    route = os.environ.get("GBB_REPLY_ROUTE", "")
-    if any(value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value)
-           for value in (instance, route)):
-        parser.error("GBB_INSTANCE_ID and GBB_REPLY_ROUTE must be safe names (1..80 characters)")
+    try:
+        target, instance, route, bridge_home = bridge_settings()
+    except BridgeError as exc:
+        parser.error(str(exc))
+    os.environ["GBB_HOME"] = bridge_home
     try:
         wait_seconds = int(os.environ.get("GBB_WAIT", "3600"))
         rounds = int(os.environ.get("GBB_MAX_ROUNDS", "8"))
@@ -705,6 +783,7 @@ def main():
                 raise BridgeError("GBB_WAIT total budget expired; inspect inbox and journal before retrying", 2)
             code, output, _ = transport({"target": target, "prompt": question,
                 "instance": instance, "route": route,
+                "request_id": request_id, "expires_at": time.time() + remaining,
                 "wait": max(1, math.floor(remaining))}, remaining + 1)
             if code:
                 raise BridgeError(f"gbb request failed (exit {code}); inspect inbox/journal before retrying", code if code > 0 else 1)

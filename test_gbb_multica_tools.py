@@ -90,7 +90,8 @@ class ToolTests(unittest.TestCase):
                     "REAL_MULTICA_FOR_HELP": REAL_CLI, "FAKE_MULTICA_STATE": str(self.state_file),
                     "MULTICA_TOKEN": "mat_OFFLINE_TASK_CREDENTIAL_123456789",
                     "MULTICA_WORKSPACE_ID": "fake-workspace", "MULTICA_TASK_ID": "offline-task",
-                    "GBB_HOME": str(self.root / "gbb"), "GBB_WAIT": "20"}
+                    "GBB_HOME": str(self.root / "gbb"), "GBB_WAIT": "20",
+                    "GBB_MULTICA_CONFIG_HOME": str(self.root / "config")}
         self.patch = patch.dict(os.environ, self.env, clear=True)
         self.patch.start()
         self.tools = Tools(time.monotonic() + 60, self.root / "gbb/multica-runs/offline-task")

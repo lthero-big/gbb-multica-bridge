@@ -1,33 +1,104 @@
 #!/usr/bin/env python3
-"""SSH endpoint: only check/inbox/answer for this Unix user's configured gbb."""
+"""Reply endpoint: check/inbox/answer/fail for this Unix user's configured gbb."""
 import argparse
+from datetime import datetime, timezone
+import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+import time
+
+
+def save_reply(config, message_id, text, *, failure=False):
+    directory = Path(config['gbb_home']) / 'messages'
+    path = directory / (message_id + '.json')
+    # A lock serializes competing helpers; atomic replacement keeps pollers from
+    # observing partial JSON. Never overwrite a different, already accepted reply.
+    with (directory / ('.' + message_id + '.reply.lock')).open('a') as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError('reply is being written; inspect inbox before retrying') from None
+                time.sleep(0.02)
+        message = json.loads(path.read_text())
+        if not isinstance(message, dict) or message.get('id') != message_id:
+            raise ValueError('stored message ID mismatch')
+        bridge = message.get('bridge', {})
+        if not isinstance(bridge, dict):
+            raise ValueError('invalid bridge metadata')
+        if bridge.get('instance') and bridge['instance'] != config['instance_id']:
+            raise ValueError('message belongs to another instance')
+        expires = bridge.get('expires_at')
+        if expires is not None and (not isinstance(expires, (int, float)) or
+                                    not math.isfinite(expires) or time.time() >= expires):
+            raise ValueError('request expired; reply was not written')
+        answer = text.strip()
+        if not answer:
+            raise ValueError('empty reply')
+        if failure:
+            request_id = bridge.get('request_id', '')
+            if not isinstance(request_id, str) or not re.fullmatch(r'[0-9a-f]{32}', request_id):
+                raise ValueError('failure reply requires a matching bridge request')
+            answer = json.dumps({'gbb_tool_protocol': 1, 'request_id': request_id,
+                                 'error': answer[:4000]}, ensure_ascii=False)
+        elif bridge.get('request_id'):
+            try:
+                value = json.loads(answer)
+            except ValueError:
+                value = None  # Plain final answers remain supported.
+            if isinstance(value, dict) and 'gbb_tool_protocol' in value and value.get('request_id') != bridge['request_id']:
+                raise ValueError('reply request_id mismatch')
+        if 'answer' in message:
+            if message['answer'] == answer:
+                return  # The acknowledgment may have been lost; no second write.
+            raise ValueError('message already answered; conflicting reply rejected')
+        message.update(answer=answer, answeredAt=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+        fd, name = tempfile.mkstemp(prefix='.' + message_id + '-', dir=directory)
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(message, stream, ensure_ascii=False, indent=2)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, path)
+        finally:
+            Path(name).unlink(missing_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--instance-id', required=True)
-    parser.add_argument('action', choices=('check', 'inbox', 'answer'))
+    parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail'))
     parser.add_argument('message_id', nargs='?')
     parser.add_argument('stdin_marker', nargs='?', choices=('-',))
     args = parser.parse_args()
-    if args.action == 'answer' and (not args.message_id or args.stdin_marker != '-'):
-        parser.error('answer requires MESSAGE_ID - and reads the complete reply from stdin')
+    if args.action in ('answer', 'fail') and (not args.message_id or args.stdin_marker != '-'):
+        parser.error('answer/fail requires MESSAGE_ID - and reads the complete reply from stdin')
     if args.action == 'check' and (args.message_id or args.stdin_marker):
         parser.error('check accepts no message or input')
-    if args.action != 'answer' and args.stdin_marker:
-        parser.error('stdin is only supported by answer')
+    if args.action not in ('answer', 'fail') and args.stdin_marker:
+        parser.error('stdin is only supported by answer/fail')
     if args.message_id and not re.fullmatch(r'm[A-Za-z0-9_-]{1,127}', args.message_id):
         parser.error('invalid message ID')
     root = Path(os.environ.get('GBB_MULTICA_CONFIG_HOME', str(Path.home() / '.config/gbb-multica')))
     config = json.loads((root / 'server.json').read_text())
     if args.instance_id != config['instance_id']:
         parser.error('instance mismatch; refusing to access another route')
+    if args.action in ('answer', 'fail'):
+        save_reply(config, args.message_id, sys.stdin.read(), failure=args.action == 'fail')
+        print(json.dumps({'id': args.message_id, 'accepted': True}))
+        return 0
     env = dict(os.environ, GBB_HOME=config['gbb_home'])
     # SSH's non-interactive PATH may omit the Node installation (e.g. nvm).
     env['PATH'] = str(Path(config['node_bin']).parent) + os.pathsep + env.get('PATH', '')
@@ -54,15 +125,17 @@ def main():
         command.append(args.message_id)
     elif args.action == 'inbox':
         command += ['--limit', '10']
-    if args.action == 'answer':
-        command.append('-')
-    # Inherit stdin so multiline JSON reaches gbb without shell interpretation.
     return subprocess.run(command, env=env, timeout=30).returncode
 
 
 if __name__ == '__main__':
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+    except ValueError as exc:
+        # JSON decoder errors may include source data; only expose our fixed reasons.
+        reason = str(exc) if type(exc) is ValueError else 'invalid configuration or message JSON'
+        print('GBB reply rejected: ' + reason, file=sys.stderr)
+        raise SystemExit(1)
+    except (OSError, KeyError, subprocess.SubprocessError):
         print('GBB endpoint failed; inspect this user\'s server.json and local configuration; no retry', file=sys.stderr)
         raise SystemExit(1)

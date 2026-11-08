@@ -104,6 +104,8 @@ def check():
         (fake_bin / "config.js").write_text('''
 export function loadConfig() { return {defaultBot: 'bridge'}; }
 export function getCredentials() { return {url: 'https://example.invalid/webhook', key: 'offline'}; }
+export function homeDir() { throw new Error('MUST_NOT_ACCESS_MESSAGES'); }
+export function writeJsonAtomic() { throw new Error('MUST_NOT_WRITE_MESSAGES'); }
 ''')
         (fake_bin / "messages.js").write_text('''
 export function newMessage() { throw new Error('MUST_NOT_CREATE_MESSAGE'); }

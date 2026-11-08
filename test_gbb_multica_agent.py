@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -25,7 +26,7 @@ def check():
         }))
         for key in ("GBB_WEBHOOK_URL", "GBB_WEBHOOK_KEY", "GBB_WAIT"):
             env.pop(key, None)
-        seen, mode = [], ["answer"]
+        seen, mode, reply_delay = [], ["answer"], [0]
         received = threading.Event()
         errors = []
 
@@ -41,6 +42,7 @@ def check():
                 self.end_headers()
                 received.set()
                 if mode[0] == "answer":
+                    time.sleep(reply_delay[0])
                     pending = subprocess.run(
                         [sys.executable, endpoint, "--instance-id", "linux-alice", "inbox", payload["message_id"]],
                         capture_output=True, text=True, env=env, timeout=5,
@@ -57,6 +59,13 @@ def check():
                     )
                     if reply.returncode:
                         errors.append(reply.stderr)
+                elif mode[0] == "reject":
+                    failed = subprocess.run(
+                        [sys.executable, endpoint, "--instance-id", "linux-alice", "fail", payload["message_id"], "-"],
+                        input="Bot cannot process this request", capture_output=True, text=True, env=env, timeout=5,
+                    )
+                    if failed.returncode:
+                        errors.append(failed.stderr)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Webhook)
         url = f"http://127.0.0.1:{server.server_address[1]}/webhook"
@@ -115,15 +124,44 @@ def check():
             assert answered.returncode == 0, answered.stderr
             assert json.loads(answered.stdout)['answer'] == answer
 
+            # File notifications are an optimization, never the only delivery path.
+            reply_delay[0] = 0.35  # Answer after the waiter is running, not during send().
+            for watcher_source in (
+                "require('node:fs').watch = () => { throw Error('watch unavailable'); };",
+                "require('node:fs').watch = () => ({on() {}, close() {}});",
+                "require('node:fs').watch = (_, cb) => { const w = new (require('node:events').EventEmitter)(); w.close=()=>{}; setImmediate(()=>w.emit('error', Error('watch failed'))); return w; };",
+            ):
+                preload = Path(tmp, 'watch-test.cjs')
+                preload.write_text(watcher_source)
+                fallback = run('-p', 'watcher fallback test', NODE_OPTIONS='--require=' + str(preload))
+                assert fallback.returncode == 0, fallback.stderr
+                assert any(e['type'] == 'assistant.message' and e['data']['content'] == answer for e in events(fallback))
+            reply_delay[0] = 0
+
+            mode[0] = 'reject'
+            before = len(seen)
+            started = time.monotonic()
+            rejected_by_bot = run('-p', 'Bot failure test', GBB_WAIT='300')
+            assert rejected_by_bot.returncode == 1, rejected_by_bot.stderr
+            assert time.monotonic() - started < 5, 'Bot failures must not wait for GBB_WAIT'
+            assert len(seen) == before + 1 and not errors, 'failure must not trigger a retry'
+            assert 'Bot cannot process this request' in rejected_by_bot.stderr
+            assert events(rejected_by_bot)[-1]['exitCode'] == 1
+            mode[0] = 'answer'
+            baseline = len(seen)
+
             for flag in ("--model", "--resume", "--unknown"):
                 before = len(seen)
                 rejected = run("-p", "must not send", flag, "unsupported")
                 assert rejected.returncode != 0 and len(seen) == before
             for wait in ("0", "invalid"):
                 rejected = run("-p", "must not send", GBB_WAIT=wait)
-                assert rejected.returncode != 0 and len(seen) == 1
+                assert rejected.returncode != 0 and len(seen) == baseline
             rejected = run('-p', 'must not send', GBB_REPLY_ROUTE='alice; touch /tmp/should-not-exist')
-            assert rejected.returncode != 0 and len(seen) == 1
+            assert rejected.returncode != 0 and len(seen) == baseline
+            for overrides in ({'GBB_REPLY_ROUTE': ''}, {'GBB_INSTANCE_ID': ''}):
+                rejected = run('-p', 'must not send', **overrides)
+                assert rejected.returncode != 0 and len(seen) == baseline
 
             mode[0] = "fail"
             before = len(seen)
