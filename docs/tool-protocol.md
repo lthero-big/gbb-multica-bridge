@@ -22,7 +22,7 @@
 | 项目 | 列表、详情、创建、编辑、状态、删除 |
 | 项目资源 | 查询、挂载、编辑、移除仓库或目录资源 |
 | 仓库登记 | 列出、添加、移除；与项目资源分别管理 |
-| Issue | 查询、搜索、创建、编辑、状态、指派、父子关系、阶段、排序、执行历史、关联 PR |
+| Issue | 查询、搜索、创建、编辑、状态、指派、父子关系、阶段、排序、执行历史、重跑指定执行、关联 PR |
 | 评论 | 分层查询、创建、编辑、删除、解决和重新打开线程 |
 | Issue 标签、属性、元数据 | 读取、添加或设置、移除 |
 | 唤醒规则 | 查询、创建、编辑、禁用、删除、触发 |
@@ -81,6 +81,8 @@ GBB_REPLY
 
 参数不确定时使用 `multica_help`，如 `{"command":["project","update"]}`；空数组列出支持的操作。命令参数以字符串数组传递，省略 `multica`、`--output` 和全局选项。正文或附件路径只能引用 `files` 中的 `@文件名`，不能读取运行端上的既有文件。评论必须使用 `--content-file`；编辑评论还需要查询结果中的 `--expected-revision`。
 
+重跑指定历史执行使用 `multica_help` 的 `{"command":["issue","rerun-task"]}` 查看当前 CLI 能力，再通过 `multica` 传入 `{"args":["issue","rerun-task","完整 run UUID"]}`。短 run ID 需加 `--issue ISSUE-ID`；当前 CLI 默认在安全时复用原目录和会话，`--fresh` 创建新会话和目录。此操作会启动执行，按写操作记账、防重复，不使用所有者凭据绕过任务权限；失败或超时后先查询执行历史，避免盲重跑。旧 CLI 不提供此命令时仍报能力缺失。
+
 查询大结果时可用 `fields` 选取顶层字段。超过 25,000 字符的结果返回 `result_id` 和 `next_offset`，通过 `multica_result` 分页读取，最多每次 40,000 字符。
 
 ## 超时、重复和费用
@@ -95,6 +97,27 @@ GBB_REPLY
 - 本任务内相同调用 ID 和相同写入内容会复用结果；同一任务重启时也读取本地记录。不同任务之间仍须先查询去重，不能承诺跨任务恰好一次。
 - 写操作超时、进程中断或响应损坏时可能已经生效。先回读状态，再决定下一步；包装不会自动重试写入或 webhook 请求。
 - 本地记录位于 gbb 数据目录的 `multica-runs/<task-id>/journal.jsonl`，权限 0600，用于检查已完成或未确认的操作。记录和发送给 Grok 的结果会遮盖任务 token、已知 webhook 凭证及敏感配置字段。
+
+## 节点计时日志
+
+包装与回填 endpoint 将节点元数据追加到 `$GBB_HOME/timing.jsonl`（默认 `~/.grok-bot-bridge/timing.jsonl`），权限为 0600。每行是独立 JSON，`v=1`，包含 UTC 毫秒时间 `ts`、`event` 和进程 `pid`。通过 `task_id`、每轮 `request_id`、`round` 与 `message_id` 关联同一条链路；工具节点另带 `call_id`。不记录任务正文、工具参数、回复内容、凭据或 webhook 地址。日志写入失败只向 stderr 报警，不阻断转发，也不改变 stdout 协议。
+
+| 节点 | 含义 |
+| --- | --- |
+| `task_start` / `task_end` | 整个包装任务开始、结束；结束含 `exit_code` 与总耗时 |
+| `round_start` / `round_return` | 一轮请求开始、传输返回；返回含 `exit_code` 与本轮耗时 |
+| `message_created` | 完整请求已存入 inbox；附正文长度 `request_chars`（UTF-16 单元） |
+| `webhook_send_start` / `webhook_send_end` | 发送开始、HTTP 返回；含 `ok`、`http_status` 与发送耗时 |
+| `inbox_start` / `inbox_end` | Bot 的完整消息读取命令在运行端开始、输出完成；含 `ok` 与读取耗时 |
+| `reply_start` / `reply_saved` / `reply_end` | 回填命令开始、原子落盘、命令完成；含 `action` 或 `ok` 及命令耗时 |
+| `reply_duplicate` | 相同回复重复回填，被幂等确认 |
+| `answer_received` | 等待进程观察到回复；含 HTTP 返回后的等待耗时 |
+| `tool_start` / `tool_end` | 包装本地执行一项 Multica 工具；含 `ok` 与执行耗时 |
+| `answer_timeout` / `transport_error` | 等待超时或传输异常；异常只记录阶段及安全错误码 |
+
+用 `webhook_send_end → inbox_start` 查看触发确认到读取命令开始的间隔，`inbox_end → reply_start` 查看 Bot 处理区间，`reply_saved → answer_received` 查看本地回填唤醒延迟。多次读取可按同一 `message_id` 分别检查。`webhook_send_end` 仅表示 HTTP 确认，不能证明 Bot 已开始执行；Bot 也可能在 HTTP 返回前读取消息。
+
+`inbox_end → reply_start` 仍包含 Bot 思考、Bot 内部工具和本地命令调度/连接等待，不能全部标成模型思考。此日志无法取得 Grok 云端排队、token 生成及 Bot 内部工具的独立时间。`elapsed_ms` 使用同进程单调时钟；跨进程节点间隔由 `ts` 计算，受系统校时及毫秒精度影响。并发追加的行顺序不保证等于事件时间顺序；错误或取消可能留下未配对的开始节点，以 `task_end` 的退出码判断结束。进程被强制杀死或主机掉电时也可能没有结束节点。升级只覆盖新启动的包装/endpoint，已有包装进程继续旧代码。
 
 ## 安装与验证
 

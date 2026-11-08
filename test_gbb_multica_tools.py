@@ -206,6 +206,27 @@ class ToolTests(unittest.TestCase):
             "args": ["project", "list"], "fields": ["id", "title"]}})
         self.assertEqual(result["data"], [{"id": "p1", "title": "small"}])
 
+    def test_rerun_task_help_execution_and_write_deduplication(self):
+        help_result = self.tools.call({"id": "rerun-help", "name": "multica_help",
+                                      "arguments": {"command": ["issue", "rerun-task"]}})
+        self.assertTrue(help_result['ok'], help_result)
+        self.assertIn('--fresh', help_result['data'])
+        self.assertIn('rerun-task', self.tools.help([])['operations']['issue'])
+        self.assertEqual(self.state()['calls'], [], 'help must not rerun a task')
+        args = ['issue', 'rerun-task', 'short-run', '--issue', 'TEST-1', '--fresh']
+        first = self.call(args, call_id='rerun1')
+        self.assertTrue(first['ok'], first)
+        self.assertIn('--fresh', self.state()['calls'][0])
+        self.assertEqual(self.call(args, call_id='rerun2'), first)
+        self.tools.close()
+        self.tools = Tools(time.monotonic() + 60, self.root / 'gbb/multica-runs/offline-task')
+        self.assertEqual(self.call(args, call_id='rerun-after-restart'), first)
+        self.assertEqual(len(self.state()['calls']), 1, 'reruns are writes and must not be repeated')
+        self.assertFalse(self.call(args + ['--workspace-id', 'other'])['ok'])
+        self.tools.available = False
+        self.assertFalse(self.call(['issue', 'rerun-task', 'other-run'])['ok'])
+        self.assertEqual(len(self.state()['calls']), 1, 'no owner-login fallback for reruns')
+
     def test_create_edit_command_shapes_use_installed_cli_flags(self):
         shapes = [
             ["project", "resource", "add", "p1", "--type", "github_repo", "--url", "https://example.invalid/a.git"],
@@ -299,6 +320,16 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(len([e for e in events if e["type"] == "tool.execution_complete"]), 3)
             self.assertEqual(events[-2]["data"]["content"], "创建、编辑、回读成功")
             self.assertFalse(errors, errors)
+            timings = [json.loads(line) for line in (home / 'timing.jsonl').read_text().splitlines()]
+            starts = [r for r in timings if r['event'] == 'tool_start']
+            ends = [r for r in timings if r['event'] == 'tool_end']
+            self.assertEqual([r['call_id'] for r in starts], ['create', 'edit', 'readback'])
+            self.assertEqual([r['call_id'] for r in ends], ['create', 'edit', 'readback'])
+            for start, end in zip(starts, ends):
+                self.assertEqual(start['request_id'], end['request_id'])
+                self.assertEqual(end['task_id'], 'roundtrip-task')
+                self.assertTrue(end['ok'])
+                self.assertGreaterEqual(end['elapsed_ms'], 0)
             before = len(self.state()["calls"])
             limited = subprocess.run([sys.executable, str(ROOT / "gbb-multica-agent"), "-p", "budgetcheck"],
                 env=dict(self.env, MULTICA_TASK_ID="budget-task", GBB_MAX_ROUNDS="1"),

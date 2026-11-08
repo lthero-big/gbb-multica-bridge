@@ -14,6 +14,32 @@ import tempfile
 import time
 
 
+def timing(home, event, **fields):
+    """Metadata only, one append per record; logging failures do not affect replies."""
+    try:
+        record = dict(v=1, ts=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                      event=event, pid=os.getpid(), **fields)
+        fd = os.open(str(Path(home) / 'timing.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps(record, ensure_ascii=False) + '\n').encode())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        print('GBB timing log unavailable; bridge continues', file=sys.stderr)
+
+
+def timing_context(message):
+    bridge = message.get('bridge', {})
+    if not isinstance(bridge, dict):
+        return {}
+    context = {key: value for key in ('task_id', 'request_id')
+               if isinstance((value := bridge.get(key)), str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value)}
+    if type(bridge.get('round')) is int:
+        context['round'] = bridge['round']
+    return context
+
+
 def save_reply(config, message_id, text, *, failure=False):
     directory = Path(config['gbb_home']) / 'messages'
     path = directory / (message_id + '.json')
@@ -60,6 +86,7 @@ def save_reply(config, message_id, text, *, failure=False):
                 raise ValueError('reply request_id mismatch')
         if 'answer' in message:
             if message['answer'] == answer:
+                timing(config['gbb_home'], 'reply_duplicate', message_id=message_id, **timing_context(message))
                 return  # The acknowledgment may have been lost; no second write.
             raise ValueError('message already answered; conflicting reply rejected')
         message.update(answer=answer, answeredAt=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
@@ -72,6 +99,7 @@ def save_reply(config, message_id, text, *, failure=False):
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(name, path)
+            timing(config['gbb_home'], 'reply_saved', message_id=message_id, **timing_context(message))
         finally:
             Path(name).unlink(missing_ok=True)
 
@@ -96,7 +124,15 @@ def main():
     if args.instance_id != config['instance_id']:
         parser.error('instance mismatch; refusing to access another route')
     if args.action in ('answer', 'fail'):
-        save_reply(config, args.message_id, sys.stdin.read(), failure=args.action == 'fail')
+        started = time.monotonic()
+        timing(config['gbb_home'], 'reply_start', message_id=args.message_id, action=args.action)
+        ok = False
+        try:
+            save_reply(config, args.message_id, sys.stdin.read(), failure=args.action == 'fail')
+            ok = True
+        finally:
+            timing(config['gbb_home'], 'reply_end', message_id=args.message_id, ok=ok,
+                   elapsed_ms=round((time.monotonic() - started) * 1000, 3))
         print(json.dumps({'id': args.message_id, 'accepted': True}))
         return 0
     env = dict(os.environ, GBB_HOME=config['gbb_home'])
@@ -115,10 +151,19 @@ def main():
     if args.action == 'inbox' and args.message_id:
         # gbb 0.2.0 exits immediately after console.log; piped large messages
         # can be cut off before Node flushes stdout. Read the same store here.
-        message = json.loads((Path(config['gbb_home']) / 'messages' / (args.message_id + '.json')).read_text())
-        if not isinstance(message, dict) or message.get('id') != args.message_id:
-            parser.error('stored message ID mismatch')
-        print(json.dumps(message, ensure_ascii=False))
+        started = time.monotonic()
+        timing(config['gbb_home'], 'inbox_start', message_id=args.message_id)
+        ok, context = False, {}
+        try:
+            message = json.loads((Path(config['gbb_home']) / 'messages' / (args.message_id + '.json')).read_text())
+            if not isinstance(message, dict) or message.get('id') != args.message_id:
+                parser.error('stored message ID mismatch')
+            context = timing_context(message)
+            print(json.dumps(message, ensure_ascii=False), flush=True)
+            ok = True
+        finally:
+            timing(config['gbb_home'], 'inbox_end', message_id=args.message_id, **context, ok=ok,
+                   elapsed_ms=round((time.monotonic() - started) * 1000, 3))
         return 0 if 'answer' in message else 2
     command = [config['gbb_bin'], args.action]
     if args.message_id:

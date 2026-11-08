@@ -2,6 +2,7 @@
 """Grok + local Multica tools, using the Copilot JSONL transport."""
 
 import argparse
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -19,10 +20,30 @@ import uuid
 VERSION = "0.4.0"
 GBB_BIN = "/usr/bin/gbb"
 NODE_BIN = "node"
+
+
+def timing(home, event, **fields):
+    """Append one metadata-only record; observability must never break execution."""
+    if home is None:
+        return
+    try:
+        record = dict(v=1, ts=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                      event=event, pid=os.getpid(), **fields)
+        data = (json.dumps(record, ensure_ascii=False) + '\n').encode()
+        fd = os.open(str(Path(home) / 'timing.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        print('GBB timing log unavailable; bridge continues', file=sys.stderr)
+
+
 COMMAND_GROUPS = {
     "workspace": "get",
     "workspace member": "list",
-    "issue": "list search get create update status assign children reorder runs run-messages timeline usage pull-requests",
+    "issue": "list search get create update status assign children reorder runs run-messages rerun-task timeline usage pull-requests",
     "issue comment": "list add update delete resolve unresolve",
     "issue label": "list add remove",
     "issue property": "list set unset",
@@ -67,6 +88,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {pathToFileURL} = require('node:url');
 let stage = 'input', moduleVersion = 'unknown', messageId = '';
+let timingHome, timingContext = {};
+function timing(event, fields = {}) {
+  if (!timingHome) return;
+  try {
+    const file = path.join(timingHome, 'timing.jsonl');
+    const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT, 0o600);
+    try {
+      fs.fchmodSync(fd, 0o600);
+      fs.writeSync(fd, JSON.stringify({v: 1, ts: new Date().toISOString(), event,
+        pid: process.pid, ...timingContext, ...fields}) + '\n');
+    } finally { fs.closeSync(fd); }
+  } catch (_) { console.error('GBB timing log unavailable; bridge continues'); }
+}
 (async () => {
   const req = JSON.parse(fs.readFileSync(0, 'utf8'));
   stage = 'gbb-path';
@@ -93,11 +127,16 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
     return;
   }
   stage = 'message-create';
+  timingHome = homeDir();
+  timingContext = {task_id: req.task_id, request_id: req.request_id, round: req.round};
   const msg = newMessage(req.target, req.prompt, hub);
   // Keep reply validation independent of truncated webhook views or model output.
-  msg.bridge = {request_id: req.request_id, instance: req.instance, expires_at: req.expires_at};
+  msg.bridge = {task_id: req.task_id, request_id: req.request_id, round: req.round,
+    instance: req.instance, expires_at: req.expires_at};
   writeJsonAtomic(path.join(homeDir(), 'messages', `${msg.id}.json`), msg);
   messageId = /^[A-Za-z0-9_-]+$/.test(msg.id) ? msg.id : '';
+  timingContext.message_id = messageId;
+  timing('message_created', {request_chars: req.prompt.length});
   console.error(`GBB message ${msg.id}; waiting up to ${req.wait}s`);
   stage = 'payload-build';
   const reply = req.route
@@ -116,9 +155,14 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
     text: `Multica task; full instructions in summary.\nbridge_instance: ${req.instance}\nreply_route: ${req.route}\nmessage_id: ${msg.id}\nNext: ${reply}`,
     summary};
   stage = 'webhook-send';
+  const sendStart = performance.now();
+  timing('webhook_send_start');
   const sent = await send(payload, {bot: hub, force: true});
+  timing('webhook_send_end', {elapsed_ms: Math.round((performance.now() - sendStart) * 1000) / 1000,
+    ok: Boolean(sent.ok), http_status: Number.isInteger(sent.status) ? sent.status : null});
   if (!sent.ok) { console.error(`GBB send failed (${sent.status || 'unavailable'}); inspect original inbox message; no retry`); process.exitCode = 1; return; }
   stage = 'answer-wait';
+  const waitStart = performance.now();
   const done = await new Promise((resolve, reject) => {
     let watcher, poll, timeout, settled = false;
     const file = path.join(homeDir(), 'messages', `${msg.id}.json`);
@@ -150,11 +194,13 @@ let stage = 'input', moduleVersion = 'unknown', messageId = '';
     timeout = setTimeout(() => check(true), req.wait * 1000);
     check(); // Also covers replies that arrived before the watcher was installed.
   });
-  if (done.answer === undefined) { console.error(`GBB timeout: ${msg.id}; inspect before retrying`); process.exitCode = 2; return; }
+  if (done.answer === undefined) { timing('answer_timeout', {elapsed_ms: performance.now() - waitStart}); console.error(`GBB timeout: ${msg.id}; inspect before retrying`); process.exitCode = 2; return; }
+  timing('answer_received', {elapsed_ms: Math.round((performance.now() - waitStart) * 1000) / 1000});
   process.stdout.write(done.answer);
 })().catch(err => {
   // Stage and identifiers are enough to diagnose failures; raw errors can carry secrets.
   const code = typeof err?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(err.code) ? err.code : 'ERROR';
+  timing('transport_error', {stage, error_code: code});
   console.error(`GBB transport failed: stage=${stage}; gbb=${moduleVersion}; code=${code}${messageId ? '; message=' + messageId : ''}; run gbb-multica-agent --check`);
   process.exitCode = 1;
 });
@@ -743,6 +789,8 @@ def main():
     emit("session.start", {"version": 1, "producer": "gbb-multica-agent"})
     emit("assistant.turn_start", {})
     tools = None
+    home, task, code = None, None, 1
+    task_start = time.monotonic()
     try:
         deadline = time.monotonic() + wait_seconds
         task = os.environ.get("MULTICA_TASK_ID") or uuid.uuid4().hex
@@ -750,9 +798,13 @@ def main():
             raise BridgeError("invalid MULTICA_TASK_ID")
         home = Path(os.environ.get("GBB_HOME") or str(Path.home() / ".grok-bot-bridge"))
         tools = Tools(deadline, home / "multica-runs" / task)
+        timing(home, 'task_start', task_id=task)
         history = []
         for index in range(rounds):
             request_id = uuid.uuid4().hex
+            context = dict(task_id=task, request_id=request_id, round=index + 1)
+            round_start = time.monotonic()
+            timing(home, 'round_start', **context)
             request = tools.redact({"request_id": request_id, "workspace_id": tools.workspace,
                 "task_tools_available": tools.available, "remaining_requests": rounds - index - 1,
                 "bridge_instance": instance, "reply_route": route,
@@ -764,9 +816,13 @@ def main():
             code, output, _ = transport({"target": target, "prompt": question,
                 "instance": instance, "route": route,
                 "request_id": request_id, "expires_at": time.time() + remaining,
+                "task_id": task, "round": index + 1,
                 "wait": max(1, math.floor(remaining))}, remaining + 1)
+            timing(home, 'round_return', **context, exit_code=code,
+                   elapsed_ms=round((time.monotonic() - round_start) * 1000, 3))
             if code:
                 raise BridgeError(f"gbb request failed (exit {code}); inspect inbox/journal before retrying", code if code > 0 else 1)
+            code = 1  # A received reply is not a successfully completed task yet.
             if not output.strip():
                 raise BridgeError("gbb returned an empty answer")
             answer, calls = parse_reply(output, request_id)
@@ -775,13 +831,18 @@ def main():
                 emit("assistant.message_delta", {"deltaContent": answer})
                 emit("assistant.message", {"content": answer, "toolRequests": []})
                 emit("result", exitCode=0)
+                code = 0
                 return 0
             if index == rounds - 1:
                 raise BridgeError("Grok request budget exhausted; last tool batch NOT executed. Inspect prior results before continuing.", 2)
             for position, call in enumerate(calls):
                 emit("assistant.message", {"content": "", "toolRequests": [{"toolCallId": call["id"],
                     "name": call["name"], "arguments": tools.redact(call["arguments"])}]})
+                tool_start = time.monotonic()
+                timing(home, 'tool_start', **context, call_id=call['id'])
                 result = tools.call(call)
+                timing(home, 'tool_end', **context, call_id=call['id'], ok=bool(result.get('ok')),
+                       elapsed_ms=round((time.monotonic() - tool_start) * 1000, 3))
                 emit("tool.execution_complete", {"toolCallId": call["id"], "success": result.get("ok", False),
                     "result": {"content": json.dumps(result, ensure_ascii=False)},
                     **({"error": {"message": result.get("error", result.get("stderr", "Multica operation failed"))}}
@@ -800,6 +861,8 @@ def main():
     except KeyboardInterrupt:
         code, error = 130, "bridge request cancelled; inspect journal for interrupted writes"
     finally:
+        timing(home, 'task_end', task_id=task, exit_code=code,
+               elapsed_ms=round((time.monotonic() - task_start) * 1000, 3))
         if tools:
             tools.close()
 

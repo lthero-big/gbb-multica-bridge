@@ -97,6 +97,11 @@ class ReliabilityTests(unittest.TestCase):
             results = list(pool.map(self.reply, ['first', 'second']))
         self.assertEqual(sorted(r.returncode for r in results), [0, 1])
         self.assertIn(json.loads(self.path.read_text())['answer'], ('first', 'second'))
+        log = self.store / 'timing.jsonl'
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(sum(r['event'] == 'reply_start' for r in records), 2)
+        self.assertEqual(sum(r['event'] == 'reply_saved' for r in records), 1)
+        self.assertEqual(sum(r['event'] == 'reply_end' for r in records), 2)
 
     def test_held_reply_lock_fails_within_bound_without_writing(self):
         before = self.path.read_bytes()
@@ -124,6 +129,8 @@ class ReliabilityTests(unittest.TestCase):
         result = self.reply('request cannot be processed', action='fail')
         self.assertEqual(result.returncode, 0, result.stderr)
         reply = json.loads(self.path.read_text())['answer']
+        records = (self.store / 'timing.jsonl').read_text()
+        self.assertNotIn('request cannot be processed', records)
         with self.assertRaisesRegex(AGENT['BridgeError'], 'request cannot be processed'):
             AGENT['parse_reply'](reply, 'a' * 32)
         for extra in ({'final': 'ambiguous'}, {'tool_calls': []}, {'error': ''}):

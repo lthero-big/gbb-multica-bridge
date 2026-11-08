@@ -54,7 +54,7 @@ def check():
                         if message["id"] != payload["message_id"] or message["question"] != payload["summary"]:
                             errors.append("inbox must preserve the matching message's complete question")
                     reply = subprocess.run(
-                        ["/usr/bin/gbb", "answer", payload["message_id"], "-"],
+                        [sys.executable, endpoint, "--instance-id", "linux-alice", "answer", payload["message_id"], "-"],
                         input=answer, capture_output=True, text=True, env=env, timeout=5,
                     )
                     if reply.returncode:
@@ -117,12 +117,44 @@ def check():
             assert stream[-1] == {"type": "result", "exitCode": 0}
             assert all("sessionId" not in e and "sessionId" not in e.get("data", {}) for e in stream)
             assert not errors, errors
+            timing_path = Path(tmp, 'timing.jsonl')
+            records = [json.loads(line) for line in timing_path.read_text().splitlines()]
+            names = [r['event'] for r in records]
+            for expected in ('task_start', 'round_start', 'message_created', 'webhook_send_start',
+                             'webhook_send_end', 'inbox_start', 'inbox_end', 'reply_start',
+                             'reply_saved', 'reply_end', 'answer_received', 'round_return', 'task_end'):
+                assert expected in names, expected
+            created = next(r for r in records if r['event'] == 'message_created')
+            assert created['message_id'] == seen[0]['message_id']
+            assert created['round'] == 1 and len(created['request_id']) == 32
+            for r in records:
+                assert r['v'] == 1 and r['ts'].endswith('Z')
+                if 'elapsed_ms' in r: assert r['elapsed_ms'] >= 0
+                if r['event'] in ('inbox_end', 'reply_saved', 'answer_received'):
+                    assert r['request_id'] == created['request_id'] and r['task_id'] == created['task_id']
+            assert records[-1]['event'] == 'task_end' and records[-1]['exit_code'] == 0
+            assert timing_path.stat().st_mode & 0o777 == 0o600
+            assert prompt not in timing_path.read_text() and answer not in timing_path.read_text()
+            assert 'offline-only' not in timing_path.read_text() and url not in timing_path.read_text()
             answered = subprocess.run(
                 [sys.executable, endpoint, '--instance-id', 'linux-alice', 'inbox', seen[0]['message_id']],
                 capture_output=True, text=True, env=env, timeout=5,
             )
             assert answered.returncode == 0, answered.stderr
             assert json.loads(answered.stdout)['answer'] == answer
+
+            # Both Python and Node logging must fail open without polluting JSON stdout.
+            saved_log = timing_path.with_suffix('.saved')
+            timing_path.rename(saved_log)
+            timing_path.mkdir()
+            try:
+                unavailable = run('-p', 'logging failure must not break the bridge')
+                assert unavailable.returncode == 0, unavailable.stderr
+                assert 'GBB timing log unavailable' in unavailable.stderr
+                assert events(unavailable)[-1]['exitCode'] == 0
+            finally:
+                timing_path.rmdir()
+                saved_log.rename(timing_path)
 
             # File notifications are an optimization, never the only delivery path.
             reply_delay[0] = 0.35  # Answer after the waiter is running, not during send().
@@ -147,6 +179,7 @@ def check():
             assert len(seen) == before + 1 and not errors, 'failure must not trigger a retry'
             assert 'Bot cannot process this request' in rejected_by_bot.stderr
             assert events(rejected_by_bot)[-1]['exitCode'] == 1
+            assert json.loads(timing_path.read_text().splitlines()[-1])['exit_code'] == 1
             mode[0] = 'answer'
             baseline = len(seen)
 
@@ -168,10 +201,17 @@ def check():
             failed = run("-p", "failure test")
             assert failed.returncode != 0 and len(seen) == before + 1, "do not retry webhook failures"
             assert any(e["type"] == "session.error" for e in events(failed))
+            records = [json.loads(line) for line in timing_path.read_text().splitlines()]
+            sent = [r for r in records if r['event'] == 'webhook_send_end'][-1]
+            assert sent['ok'] is False and sent['http_status'] == 503
+            assert records[-1]['event'] == 'task_end' and records[-1]['exit_code'] == 1
 
             mode[0] = "wait"
             timeout = run("-p", "timeout test", GBB_WAIT="1")
             assert timeout.returncode == 2 and events(timeout)[-1]["exitCode"] == 2
+            records = [json.loads(line) for line in timing_path.read_text().splitlines()]
+            assert any(r['event'] == 'answer_timeout' and r['task_id'] == records[-1]['task_id'] for r in records)
+            assert records[-1]['event'] == 'task_end' and records[-1]['exit_code'] == 2
 
             received.clear()
             process = subprocess.Popen(
@@ -186,6 +226,8 @@ def check():
                 process.send_signal(signal.SIGTERM)
                 process.communicate(timeout=5)
                 assert process.returncode == 130
+                terminal = json.loads(timing_path.read_text().splitlines()[-1])
+                assert terminal['event'] == 'task_end' and terminal['exit_code'] == 130
                 assert all(not Path(f"/proc/{pid}").exists() for pid in children), "cancel must reap gbb"
             finally:
                 if process.poll() is None:
