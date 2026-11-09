@@ -48,7 +48,7 @@ bash install.sh local --check
 
 `local` 接受运行端参数，包括 `--profile`、`--workspace-id`、`--agent-name`、`--gbb-home` 和 `--reply-route`。两端自动共享这些设置；重复执行复用已有资源。自定义数据目录、路由名也不需要再配置一次回传端。
 
-配置完成后，终端直接显示“Grok Bot 提示词开始 / 结束”复制区。把两条分隔线之间的完整内容粘贴到本机 Grok Bot，助手路径、命令示例和路由已自动填好；允许其工具执行能力调用提示词中的回填助手。相同内容保存在 `~/.config/gbb-multica/grok-bot-prompt.md`（设置了 `GBB_MULTICA_CONFIG_HOME` 时保存在该目录），重跑安装也会再次显示。本机部署仍通过 webhook 向 Bot 发送任务，通过本机 endpoint 回填；请保留 webhook URL/key 配置。最后在 Multica 新聊天验证 `GBB_RUNTIME_OK`。
+配置完成后，终端直接显示“Grok Bot 提示词开始 / 结束”复制区。把两条分隔线之间的完整内容粘贴到本机 Grok Bot，助手路径、命令示例和路由已自动填好；允许其工具执行能力调用提示词中的回填助手。相同内容保存在 `~/.config/gbb-multica/grok-bot-prompt.md`（设置了 `GBB_MULTICA_CONFIG_HOME` 时保存在该目录），首次生成或引导/路由内容变化时显示。本机部署仍通过 webhook 向 Bot 发送任务，通过本机 endpoint 回填；请保留 webhook URL/key 配置。最后在 Multica 新聊天验证 `GBB_RUNTIME_OK`。
 
 运行端已经配置好时，`reply --route 原路由名` 会识别匹配的本机实例，自动采用本机直连；原有 SSH 路由保持其已保存的连接方式，显式 `--transport` 可以指定方式。
 
@@ -265,9 +265,22 @@ bash install.sh update          # 快进源码，再用新版安装器重装本�
 
 管理入口由 local / runtime / reply 安装成功后写入 `~/.local/bin/gbb-multica`，依赖原 Git 克隆目录。旧版首次升级仍需 `git pull --ff-only` 后重跑原安装命令；单独复制 `gbb-multica-setup.sh` 的安装不带源码更新器，需要先保留一份完整克隆。更新以项目 `origin/main` 的提交为准，没有后台自动升级。`--check` 使用 `git ls-remote`，不执行 fetch、不写 refs、不替换文件，检查成功返回 0；是否有更新在输出中说明，网络/权限失败返回非零，不会把失败说成“已是最新”。
 
-实际更新要求 origin 是本项目、当前处于干净的 `main`，拒绝本地修改、未跟踪文件、开发分支和非快进分叉；不会自动 stash、reset 或切换分支。检查更新和安装依旧是两个独立动作；命令启动时不会自动联网。更新复用 `server.json` 和 `routes.json` 的原实例、Bot、profile、工作区、SSH 连接及 endpoint；不会创建第二套部署，也不自动更新另一台机器。完整升级后仍需同步 Bot 的运行提示词。官方 Multica CLI 的升级是另一件事，可在普通终端使用 `multica update`，本项目不会代为升级或重启 daemon。
+实际更新要求 origin 是本项目、当前处于干净的 `main`，拒绝本地修改、未跟踪文件、开发分支和非快进分叉；不会自动 stash、reset 或切换分支。更新复用 `server.json` 和 `routes.json` 的原实例、Bot、profile、工作区、SSH 连接及 endpoint。官方 Multica CLI 的升级独立使用 `multica update`；本项目不会代为升级或重启 daemon。
 
-运行端安装和新任务使用同一数据目录的共享/独占锁；活动任务或其他安装进程存在时停止升级。旧包装的运行通过已有 journal 锁检测；安装器同时补查已知 Agent 的活动状态，包括 dispatched 和 waiting_local_directory。安装期间新启动的包装会明确失败，避免混用正在替换的组件，因此应在任务空闲时操作。跨机器的回传端更新只替换该端本地助手，不替远端管理任务。各文件替换仍是逐个原子替换，不承诺整套部署事务回滚；中途失败保留已完成的操作和备份，修复原因后重跑更新命令。
+0.5.3 增加跨端统一升级，从 **Grok 回传电脑** 的普通终端执行：
+
+```bash
+~/.local/bin/gbb-multica update --all --check
+~/.local/bin/gbb-multica update --all
+```
+
+它只使用 `routes.json` 中已有 SSH 连接，不猜反向地址或建立新授权。先检查本机、每个运行端的身份、管理入口、干净 main、目标提交和活动锁；预检查全部通过后，按同一个 main 提交依次升级运行端，再升级本机已有组件。重复的同目标路由只升级一次。本机直连路由必须属于同一安装器管理的运行端。端点会报告实际安装的 `source_commit`，升级后再核对；升级期间 main 变化会停止，而不是悄悄混用新提交。
+
+**首次迁移**：旧端点没有协同升级入口，需要各端先使用原来的 `update` 升级一次到 0.5.3+。运行端没有回传电脑的反向连接，不能在运行端凭空升级回传电脑。`--all --check` 不拉取或安装源码、不创建锁文件；主机不可达、工作区有修改或任务忙时不会开始部署。
+
+运行端安装和新任务使用同一数据目录的共享/独占锁；旧包装通过 journal 锁检测，安装器还检查已知 Agent 的活动状态（含 dispatched 和 waiting_local_directory）。安装期间新任务会明确失败，因此应在空闲时更新。各文件逐个原子替换，不承诺多主机事务或整套回滚：第二台失败时第一台可能已完成，控制台明确列出已完成的端，并停止后续步骤，不自动重试。
+
+Bot 提示词改为稳定引导：第一次部署或从旧例程迁移时粘贴一次。之后每个新任务先读完整 inbox，其中的 `GBB_TOOL_PROTOCOL_V1` 指令、`protocol_revision` 和 `bridge_version` 定义当前协议；回传助手补入真实路径的 `reply_commands`，无需按版本改云端提示词。助手路径、路由目录或引导本身变化仍需要同步。相同引导不再重复打印；本地生成文件不证明云端已更新，安装器没有 Grok 云端编辑 API，也不声称自动修改了 Bot。
 
 已有资源复用，变更的配置文件先备份；不会自动发测试消息。`runtime --check` 返回 2 表示 Multica 配置尚需修正，其他非零状态表示检查/权限/连接失败。
 

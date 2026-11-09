@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
+VERSION = '0.5.3'
 
 
 def ssh_base(route):
@@ -60,6 +61,19 @@ def route_command(route, action, message_id=None):
     raise ValueError('unsupported transport')
 
 
+def decorate(result, route_name):
+    """Use this machine's actual helper path, regardless of the runtime host."""
+    if not isinstance(result, dict):
+        return result
+    message = result.get('message') if result.get('state') == 'ready' else result
+    if isinstance(message, dict) and re.fullmatch(r'm[A-Za-z0-9_-]{1,127}', str(message.get('id', ''))):
+        prefix = [str(Path(__file__).resolve())]
+        message['reply_commands'] = {action: [*prefix, action, route_name, message['id'],
+                                   *(['-'] if action in ('answer', 'fail', 'exchange') else [])]
+                                   for action in ('answer', 'fail', 'exchange', 'wait')}
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail', 'exchange', 'wait'))
@@ -81,7 +95,18 @@ def main():
     if not route:
         parser.error('unknown route; configure it with install.sh reply first')
     # No local shell, no credentials in argv, no automatic retry on failure.
-    return subprocess.run(route_command(route, args.action, args.message_id), timeout=45).returncode
+    response = subprocess.run(route_command(route, args.action, args.message_id), timeout=45,
+                              capture_output=True, text=True)
+    if response.returncode not in (0, 2):
+        print(response.stderr, file=sys.stderr, end='')
+        return response.returncode
+    result = json.loads(response.stdout)
+    if args.action == 'check':
+        result['reply_bridge_version'] = VERSION
+    else:
+        result = decorate(result, args.route)
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return response.returncode
 
 
 if __name__ == '__main__':

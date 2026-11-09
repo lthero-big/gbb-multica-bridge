@@ -21,7 +21,7 @@ import time
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '0.5.2'
+VERSION = '0.5.3'
 UPSTREAM_URLS = ('https://github.com/lthero-big/gbb-multica-bridge.git',
                  'https://github.com/lthero-big/gbb-multica-bridge',
                  'git@github.com:lthero-big/gbb-multica-bridge.git',
@@ -61,6 +61,60 @@ def install_manager(bin_dir):
     write_file(bin_dir / 'gbb-multica', source, 0o755)
 
 
+def peer_command(router, route, management, revision, check=False):
+    require(isinstance(management, dict), '运行端缺少协同升级入口；请先在该端普通终端更新一次到 0.5.3+')
+    require(management.get('protocol') == 1, '运行端尚不支持协同升级；请先在该端普通终端更新一次到 0.5.3+')
+    command = management.get('command')
+    config_home = management.get('config_home')
+    require(isinstance(command, str) and command.startswith('/') and
+            isinstance(config_home, str) and config_home.startswith('/') and
+            not any(c in command + config_home for c in '\0\n\r'), '运行端升级入口无效')
+    remote = ['env', 'GBB_MULTICA_CONFIG_HOME=' + config_home, command, 'update', '--revision', revision]
+    if check:
+        remote += ['--check']
+    return [*router['ssh_base'](route), shlex.join(remote)]
+
+
+def fleet_plan(routes, revision, server=None):
+    """Read-only preflight of every configured SSH peer before changing any host."""
+    require(routes, '--all 请从已配置回传路由的电脑执行；运行端没有反向 SSH 连接')
+    router = runpy.run_path(str(ROOT / 'gbb-multica-remote'))
+    peers, seen = [], set()
+    for name, route in routes.items():
+        if route.get('transport', 'ssh') == 'local':
+            require(server and route.get('instance_id') == server.get('instance_id') and
+                    route.get('endpoint') == str(Path(server['wrapper']).with_name('gbb-multica-endpoint')),
+                    f'本机路由 {name} 不属于此安装器的运行端，无法统一升级')
+            continue
+        identity = (route.get('ssh_alias'), route.get('ssh_config'), route.get('instance_id'))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        status = json.loads(run(router['route_command'](route, 'check'),
+                                capture_output=True, text=True, timeout=45).stdout)
+        require(status.get('ok') is True and status.get('instance_id') == route.get('instance_id'),
+                f'路由 {name} 的运行端身份/配置不匹配')
+        management = status.get('management', {})
+        preflight = peer_command(router, route, management, revision, check=True)
+        run(preflight, timeout=60)
+        peers.append((name, route, management))
+    return router, peers
+
+
+def check_idle(home):
+    """Inspect existing locks without creating files during update --check."""
+    import fcntl
+    for path in [home / 'deployment.lock', *home.glob('multica-runs/*/lock')]:
+        if not path.exists():
+            continue
+        require(not path.is_symlink(), '拒绝读取符号链接锁文件')
+        with path.open('r') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('Bridge has an active task or installation; finish it before updating') from None
+
+
 def update(args, config_root, bin_dir):
     require(args.check or not task_context(), '请在普通终端更新 Bridge；不能在 Multica 任务中替换运行程序')
     require(shutil.which('git'), '检查更新需要 Git；请使用原克隆目录')
@@ -76,6 +130,8 @@ def update(args, config_root, bin_dir):
     dirty = bool(git('status', '--porcelain'))
     latest = git('ls-remote', '--exit-code', 'origin', 'refs/heads/main').split()[0]
     require(re.fullmatch(r'[0-9a-f]{40,64}', latest), '远端 main 未返回有效提交')
+    revision = getattr(args, 'revision', None)
+    require(not revision or revision == latest, 'main 已变化或指定提交不是当前 main；未更新，请重新检查所有端')
     ancestor = subprocess.run(['git', '-C', str(ROOT), 'merge-base', '--is-ancestor', latest, current],
                               capture_output=True, timeout=10).returncode == 0
     server = read_config(config_root / 'server.json')
@@ -88,18 +144,36 @@ def update(args, config_root, bin_dir):
                   ('与远端提交一致' if config.get('source_commit') == latest else '可重装以同步源码'))
     if dirty:
         print('本地有未提交或未跟踪文件；更新会停止，保留这些文件。')
-    if args.check:
+    all_hosts = getattr(args, 'all_hosts', False)
+    if args.check and not (revision or all_hosts):
         return 0
+    require(not ancestor or current == latest, '本地 main 含未发布提交；拒绝以不同提交升级各端，请先自行核对')
     require(not dirty, '仓库不干净，未更新；请先提交或移走自己的修改')
     require(git('symbolic-ref', '--short', 'HEAD') == 'main', '自动更新只用于 main；请先自行切换到 main，不会覆盖开发分支')
     require(server or routes.get('routes'), '未找到已有部署配置；请先运行 local / runtime / reply 安装')
+    if server:
+        check_idle(Path(server['gbb_home']))
+    router, peers = fleet_plan(routes.get('routes', {}), latest, server) if all_hosts else (None, [])
+    if args.check:
+        print(f'预检查通过；目标提交 {latest}；远程运行端 {len(peers)} 个，尚未更新。')
+        return 0
     # Check before changing the checkout; the new installer checks again before replacing files.
     if server:
         shared = runpy.run_path(str(ROOT / 'gbb-multica-agent'))
         with shared['deployment_lock'](Path(server['gbb_home']), exclusive=True):
             pass
+    # Preflight all peers first, then update them to the SAME main commit. On a
+    # failure stop immediately; already completed hosts remain visible in stdout.
+    for name, route, management in peers:
+        print(f'正在更新运行端 {name} → {latest[:12]}', flush=True)
+        run(peer_command(router, route, management, latest), timeout=900)
+        status = json.loads(run(router['route_command'](route, 'check'),
+                                capture_output=True, text=True, timeout=45).stdout)
+        require(status.get('source_commit') == latest, f'{name} 更新后提交不匹配；已停止，未重试')
+        print(f'运行端已完成：{name} → {latest[:12]}', flush=True)
     git('fetch', 'origin', 'main')
     fetched = git('rev-parse', 'FETCH_HEAD')
+    require(fetched == latest, '升级期间 main 已变化；本机尚未安装，请检查已完成的运行端后重跑')
     git('merge', '--ff-only', fetched)
     # Re-enter the updated installer, so upgrades use the NEW implementation.
     command = [sys.executable, str(ROOT / 'install.py')]
@@ -107,7 +181,9 @@ def update(args, config_root, bin_dir):
         run([*command, 'runtime', '--instance-id', server['instance_id']], timeout=600)
     for route in routes.get('routes', {}):
         run([*command, 'reply', '--route', route], timeout=120)
-    print('本机已配置组件更新完成。跨机部署还需在另一端运行同一更新命令，并按生成的提示词更新 Bot。')
+    print('已完成本机' + ('及已配置运行端' if all_hosts else '') + f'升级，提交 {latest[:12]}。')
+    if not all_hosts and routes.get('routes'):
+        print('跨机统一升级请从回传端使用 update --all。Bot 从每次完整 inbox 读取当前协议；已有旧例程需要一次引导迁移。')
     return 0
 
 
@@ -296,7 +372,8 @@ def runtime(args, config_root, bin_dir):
     saved = dict(instance_id=instance, bot=bot, gbb_home=str(home), gbb_bin=str(gbb),
                  node_bin=node, wrapper=str(bin_dir / 'gbb-multica-agent'), user=pwd.getpwuid(os.geteuid()).pw_name,
                  profile=profile, workspace_id=workspace, reply_route=route, agent_name=agent,
-                 archive_sha256=ARCHIVE_SHA256, bridge_version=VERSION, source_commit=source_commit())
+                 archive_sha256=ARCHIVE_SHA256, bridge_version=VERSION, source_commit=source_commit(),
+                 management=dict(protocol=1, command=str(bin_dir / 'gbb-multica'), config_home=str(config_root.resolve())))
     write_file(config_root / 'server.json', json.dumps(saved, ensure_ascii=False, indent=2) + '\n')
     run([endpoint, '--instance-id', instance, 'check'])
     print(f'运行端安装完成。回填路由：{route}；实例：{instance}')
@@ -411,17 +488,25 @@ def reply(args, config_root, bin_dir):
         return 0
     helper = install_executable('gbb-multica-remote', bin_dir)
     routes[route_name] = item
-    config.update(bridge_version=VERSION, source_commit=source_commit())
-    write_file(config_root / 'routes.json', json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     prompt = config_root / 'grok-bot-prompt.md'
     content = prompt_for_routes(routes, helper, item['bot'])
+    # Each Bot has its own bootstrap. Comparing only the last global output
+    # would demand a paste on every update when routes use different Bots.
+    bot_prompt = config_root / 'bot-prompts' / (hashlib.sha256(item['bot'].encode()).hexdigest() + '.md')
+    prompt_changed = not bot_prompt.exists() or bot_prompt.read_text() != content
+    config.update(bridge_version=VERSION, source_commit=source_commit(),
+                  bootstrap_sha256=hashlib.sha256(content.encode()).hexdigest())
+    write_file(config_root / 'routes.json', json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    write_file(bot_prompt, content)
     write_file(prompt, content)
     print(f'回传端配置完成。路由：{route_name} → {target}；未发送 Grok 请求。')
     print(f'完整提示词已保存：{prompt}')
     print('检查命令：' + shlex.join([str(helper), 'check', route_name]))
-    show_prompt(content, '已填好助手路径和路由的完整提示词')
-    print('请用以上完整内容更新已有 Bot 的处理说明，并允许其工具执行环境调用助手。')
-    print('然后在 Multica 新聊天发送：请只回复 GBB_RUNTIME_OK。')
+    if prompt_changed:
+        show_prompt(content, '仅首次部署或路由/引导变化时需要同步的提示词')
+        print('请将引导说明同步到 Bot 一次；后续工具协议随每次 inbox 自动提供。安装器不能修改云端 Bot，未将生成文件视作已同步。')
+    else:
+        print('Bot 引导说明未变化；当前协议随完整 inbox 提供，无需按版本重新粘贴。')
     return 0
 
 
@@ -588,6 +673,8 @@ def build_parser():
   bash install.sh ssh --ssh-alias multica-alice --ssh-host example.com --ssh-user alice
   bash install.sh update --check          # 只读查询远端 main 和已安装版本
   bash install.sh update                  # 快进更新并重装本机已有组件
+  bash install.sh update --all --check    # 从回传端预检查全部运行端
+  bash install.sh update --all            # 同一提交升级各运行端及本机
 
 local / runtime / reply / ssh 支持 Linux、macOS。本机同用户部署选 local，无需 SSH。
 旧 server / mac 命令分别是 runtime / reply 的兼容别名。
@@ -602,6 +689,8 @@ local / runtime / reply / ssh 支持 Linux、macOS。本机同用户部署选 lo
     common.add_argument('--bot', metavar='BOT', help='运行端的 gbb Bot alias / 回传端提示词标注；默认 bridge-实例名')
     common.add_argument('--check', action='store_true', help='只读检查；update 只查询远端版本，SSH 模式仅验证免密登录；不发送 Grok 请求')
     common.add_argument('--dry-run', action='store_true', help='仅展示步骤；不连接、不写文件')
+    common.add_argument('--all', dest='all_hosts', action='store_true', help='update：通过已有 SSH 路由协同更新运行端和本机')
+    common.add_argument('--revision', metavar='COMMIT', help='update：锁定本次 main 提交；协同升级内部使用')
     runtime_options = parser.add_argument_group('本机部署 local / 运行端 runtime')
     runtime_options.add_argument('--profile', help='已有 Multica 登录配置；默认当前配置，不创建 profile')
     runtime_options.add_argument('--workspace-id', metavar='UUID', help='目标工作区 UUID；默认当前工作区')
@@ -626,7 +715,11 @@ def validate_args(parser, args):
     if args.mode == 'update' and any(getattr(args, name) for name in
             ('instance_id', 'bot', 'profile', 'workspace_id', 'reply_route', 'agent_name', 'gbb_home',
              'route', 'transport', 'endpoint', 'ssh_alias', 'setup_ssh', 'ssh_host', 'ssh_user', 'ssh_port', 'ssh_key', 'interactive')):
-        parser.error('update 复用已保存配置，只接受 --check / --dry-run')
+        parser.error('update 复用已保存配置，只接受 --check / --dry-run / --all / --revision')
+    if args.mode != 'update' and (args.all_hosts or args.revision):
+        parser.error('--all / --revision 仅用于 update')
+    if args.revision and not re.fullmatch(r'[0-9a-f]{40,64}', args.revision):
+        parser.error('--revision 必须是完整提交哈希')
     connection_options = any(value is not None for value in (args.ssh_host, args.ssh_user, args.ssh_port, args.ssh_key))
     if args.mode == 'reply' and any(value is not None for value in
             (args.profile, args.workspace_id, args.reply_route, args.agent_name, args.gbb_home)):
@@ -667,7 +760,7 @@ def main():
                'runtime': '运行端：校验 gbb 0.2.0 → 用户目录安装 → 配置已有 Bot → 检查 daemon → 注册 runtime/Agent → 安装 endpoint',
                'reply': '回传端：选择本机/SSH → 核对运行端实例 → 安装回填助手 → 合并路由 → 生成 Bot 提示词',
                'ssh': 'SSH：生成/复用密钥 → 必要时一次密码登录追加公钥 → 验证免密 → 保存独立连接',
-               'update': '更新：只读查询 origin/main → 核对干净 main 和忙碌状态 → 快进 → 用新安装器重装本机已有组件'}[args.mode])
+               'update': '更新：查询 origin/main → 核对干净 main 和忙碌状态 → --all 时先预检查各端并锁定同一提交 → 快进重装'}[args.mode])
         return 0
     os.umask(0o077)
     guard = nullcontext()

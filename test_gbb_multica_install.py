@@ -182,6 +182,21 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
                       '\n========== Grok Bot 提示词结束 ==========', output.getvalue())
         self.assertIn(shlex.quote(str(bin_dir / 'gbb-multica-remote')) + ' answer', prompt)
         self.assertNotIn('OFFLINE_SECRET_NEVER_PRINT', output.getvalue())
+        unchanged = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), redirect_stdout(unchanged):
+            INSTALL['mac'](args, config_root, bin_dir)
+        self.assertNotIn('========== Grok Bot 提示词开始', unchanged.getvalue())
+        self.assertIn('Bot 引导说明未变化', unchanged.getvalue())
+        # Bring Alice's initial single-route bootstrap up to the complete catalog.
+        with patch.dict(os.environ, environment, clear=True), redirect_stdout(io.StringIO()):
+            alice_args = argparse.Namespace(route='alice', instance_id='alice', ssh_alias='server-alice', endpoint=None,
+                                            bot='bridge-alice', check=False)
+            INSTALL['mac'](alice_args, config_root, bin_dir)
+        repeated = io.StringIO()
+        with patch.dict(os.environ, environment, clear=True), redirect_stdout(repeated):
+            INSTALL['mac'](args, config_root, bin_dir)
+            INSTALL['mac'](alice_args, config_root, bin_dir)
+        self.assertNotIn('========== Grok Bot 提示词开始', repeated.getvalue())
         reply = '中文\n{"final":"保留 $HOME、`字面量`、引号"}\n第二行'
         for name, home in (('alice', Path(self.server['gbb_home'])), ('bob', self.bob_gbb)):
             messages = home / 'messages'
@@ -310,13 +325,17 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         command = ['bash', ROOT / 'install.sh', 'local', '--instance-id', 'desktop', '--bot', 'bridge-desktop',
                    '--gbb-home', str(store), '--reply-route', 'desktop-reply', '--profile', 'desktop-login']
         before = self.ssh_log.read_bytes() if self.ssh_log.exists() else b''
-        for _ in range(2):
+        for attempt in range(2):
             result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('LOCAL_OFFLINE_ONLY', result.stdout + result.stderr)
             prompt = (config_root / 'grok-bot-prompt.md').read_text()
-            self.assertIn('========== Grok Bot 提示词开始 ==========\n' + prompt.rstrip() +
-                          '\n========== Grok Bot 提示词结束 ==========', result.stdout)
+            if attempt == 0:
+                self.assertIn('========== Grok Bot 提示词开始 ==========\n' + prompt.rstrip() +
+                              '\n========== Grok Bot 提示词结束 ==========', result.stdout)
+            else:
+                self.assertNotIn('========== Grok Bot 提示词开始', result.stdout)
+                self.assertIn('Bot 引导说明未变化', result.stdout)
             self.assertIn(shlex.quote(str(home / '.local/bin/gbb-multica-remote')) + ' answer', prompt)
             self.assertNotIn('/实际路径/', prompt)
             self.assertIn('Please rename yourself to "bridge-desktop".', prompt)
