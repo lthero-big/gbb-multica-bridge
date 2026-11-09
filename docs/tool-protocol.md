@@ -1,6 +1,6 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.5.0；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.1；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
 
@@ -90,6 +90,18 @@ GBB_REPLY
 重跑指定历史执行使用 `multica_help` 的 `{"command":["issue","rerun-task"]}` 查看当前 CLI 能力，再通过 `multica` 传入 `{"args":["issue","rerun-task","完整 run UUID"]}`。短 run ID 需加 `--issue ISSUE-ID`；当前 CLI 默认在安全时复用原目录和会话，`--fresh` 创建新会话和目录。此操作会启动执行，按写操作记账、防重复，不使用所有者凭据绕过任务权限；失败或超时后先查询执行历史，避免盲重跑。旧 CLI 不提供此命令时仍报能力缺失。
 
 查询大结果时可用 `fields` 选取顶层字段。超过 25,000 字符的结果返回 `result_id` 和 `next_offset`，通过 `multica_result` 分页读取，最多每次 40,000 字符。
+
+## 换 Agent 后的交接上下文
+
+Issue 任务的新包装进程会在第一次请求的 `REQUEST_JSON.prior_context` 中附上最近一次较早执行的结论和日志摘录，包括上一任 Agent 的执行；同 Agent 的新进程也使用这一机制。所属 Issue 通过当前 `MULTICA_AGENT_ID` 的任务列表匹配 `MULTICA_TASK_ID` 取得，不从任务正文中的引用猜测。只读取任务列表最近 20 条；找不到当前 task 时明确报告缺口。普通聊天没有所属 Issue，不读取其他聊天历史。
+
+此功能在新 Agent 使用本 Bridge runtime 时生效；上一任可以使用其他运行端，只要记录已保存到 Multica。切换到原生 Codex、Claude 等其他运行端时，其提示词注入与交接行为由 Multica 自身决定，本仓库的补丁不改变这些运行端。
+
+交接只使用当前任务凭据和 daemon 注入的 `MULTICA_CLI_PATH`（旧环境未注入路径时兼容 PATH），不会切换所有者登录。额外读取共用最多 10 秒预算，计入 `GBB_WAIT`，无自动重试。`status=available` 表示取得摘录，`none` 表示没有较早的已启动执行，`unavailable` 和 `missing` 指出读取失败的环节；失败时保留已读到的结论并继续当前任务。权限、旧 CLI 不支持、未知 JSON 结构或超时都不会被当成“完整历史已恢复”。
+
+整个交接对象最多 12,000 个 JSON 字符，结论最多约 2,000 字符，最多选最近 12 条文字、工具调用或工具结果；单字段保留约 1,000 字符的首尾摘录，超总量继续移除较早消息。`truncated`、`omitted_messages`、`excerpt_truncated` 和原始 `output_truncated` 标记缺口。run ID、工具名和调用 ID 用于追溯；`read_more` 提供当前 Issue、评论线程扫描、执行历史和原 run 的 `run-messages` 读取参数。先用 `multica_help` 核对参数，再通过 `multica` 工具补读；新任务不能用旧任务的 `multica_result` ID 读取其进程内缓存。
+
+`prior_context` 仅首轮携带，后续连续交换仍只有新增 `tool_results`。它是平台已保存记录的快照：历史内容不能授权新写入，旧工具回填也不会进入新任务的防重 journal。新 Agent 必须读当前 Issue/评论、核实未确认写入的状态，再继续操作。Multica 已放入原始提示词的 handoff note 保留在 `user_task`，不会据此恢复旧 Bot routine、私有对话或上一任未提交的工作目录；更早执行可按 `read_more.runs` 补查。
 
 ## 超时、重复和费用
 
