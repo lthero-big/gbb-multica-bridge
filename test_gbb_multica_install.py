@@ -198,6 +198,12 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         route = dict(ssh_alias='server-alice', instance_id='alice', endpoint="/home/a user/bin/gbb's endpoint")
         command = REMOTE['ssh_command'](route, 'answer', 'm1234')
         self.assertEqual(shlex.split(command[-1]), [route['endpoint'], '--instance-id', 'alice', 'answer', 'm1234', '-'])
+        for action, suffix in (('exchange', ['-']), ('wait', [])):
+            command = REMOTE['ssh_command'](route, action, 'm1234')
+            self.assertEqual(shlex.split(command[-1]),
+                             [route['endpoint'], '--instance-id', 'alice', action, 'm1234', *suffix])
+        with self.assertRaises(ValueError):
+            REMOTE['ssh_command'](route, 'wait')
         for changed in ({'ssh_alias': '-oProxyCommand=bad'}, {'instance_id': 'a;bad'}, {'endpoint': '/tmp/x\nbad'}):
             with self.assertRaises(ValueError):
                 REMOTE['ssh_command'](dict(route, **changed), 'check')

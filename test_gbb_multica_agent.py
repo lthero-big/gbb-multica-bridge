@@ -86,7 +86,7 @@ def check():
                 return [json.loads(line) for line in result.stdout.splitlines()]
 
             version = run("--version")
-            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.4.0"
+            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.0"
             assert not seen, "version must never send a request"
 
             config_before = Path(tmp, "config.json").read_bytes()
@@ -228,6 +228,10 @@ def check():
                 assert process.returncode == 130
                 terminal = json.loads(timing_path.read_text().splitlines()[-1])
                 assert terminal['event'] == 'task_end' and terminal['exit_code'] == 130
+                mid = seen[-1]['message_id']
+                message = json.loads(Path(tmp, 'messages', mid + '.json').read_text())
+                session = json.loads(Path(tmp, 'sessions', message['bridge']['session_id'] + '.json').read_text())
+                assert session['status'] == 'closed' and session['exit_code'] == 130
                 assert all(not Path(f"/proc/{pid}").exists() for pid in children), "cancel must reap gbb"
             finally:
                 if process.poll() is None:

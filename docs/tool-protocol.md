@@ -1,6 +1,6 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.4.0；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.0；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
 
@@ -47,17 +47,23 @@
 "$HOME/.local/bin/gbb-multica-remote" inbox ROUTE MESSAGE_ID
 ```
 
-完整问题末尾的 `REQUEST_JSON` 给出本轮 `request_id`、当前任务、剩余请求数和此前工具结果。`request_id` 是包装生成的校验值；`MESSAGE_ID` 是 gbb 消息 ID，二者不同。
+完整问题末尾的 `REQUEST_JSON` 给出本轮 `request_id`、剩余轮数及交互模式。配置回传路由的任务使用 `delivery_mode=continuous`：首轮包含原始任务和工具说明，后续只有本轮新增的 `tool_results`，此前上下文由同一次 Bot 运行保留。`request_id` 是包装生成的校验值；`MESSAGE_ID` 是 gbb 消息 ID，二者不同。
 
 要查询项目，向**本轮**消息回填：
 
 ```bash
-"$HOME/.local/bin/gbb-multica-remote" answer ROUTE MESSAGE_ID - <<'GBB_REPLY'
+"$HOME/.local/bin/gbb-multica-remote" exchange ROUTE MESSAGE_ID - <<'GBB_REPLY'
 {"gbb_tool_protocol":1,"request_id":"复制本轮 request_id","tool_calls":[{"id":"projects1","name":"multica","arguments":{"args":["project","list"],"fields":["id","title","status"]}}]}
 GBB_REPLY
 ```
 
-包装执行后会发出一条**新消息**。继续读取该消息，在其中查看 `history` 里的真实结果，然后回复最终回答或下一批工具调用：
+`exchange` 原子提交工具调用，并最多等 25 秒。返回 `{"state":"ready","message":{...}}` 时，直接读取该消息 `question` 的 REQUEST_JSON.tool_results，使用新 message.id 和 request_id 继续交换。返回 `{"state":"pending","message_id":"..."}` 时，运行以下命令继续等同一条消息的结果，保持本次 Bot 运行，不再触发 Webhook，也不重新提交工具：
+
+```bash
+"$HOME/.local/bin/gbb-multica-remote" wait ROUTE MESSAGE_ID
+```
+
+`state=closed` 表示任务已结束、取消或超时，停止处理。`exchange` 的同内容重复回填会读取同一个后继结果，不重复执行工具；不同内容被拒绝。最终回答仍通过 `answer ROUTE 新MESSAGE_ID -` 回填：
 
 ```json
 {"gbb_tool_protocol":1,"request_id":"新消息的 request_id","final":"已查到项目，结果如下……"}
@@ -92,7 +98,8 @@ GBB_REPLY
 - 回填助手原子保存回复，拒绝过期请求、其他实例、错误 request_id 和已有不同回复。同一回复重复提交只确认，不覆盖第一次结果；新回复不再通过会提前退出的 gbb CLI 输出管道保存。已有旧消息没有截止时间元数据时保持兼容。
 - 包装监听消息目录变化，回复原子落盘后即可唤醒；文件监听不可用、报错或漏通知时仍由 1 秒轮询兜底。转发耗时与 Bot 思考及工具执行耗时分别计算。
 - `GBB_WAIT` 默认 3600 秒（1 小时），包含整个多轮流程，而非每轮分别等待 1 小时。
-- `GBB_MAX_ROUNDS` 默认 8，允许 1–32；每一轮都是一次真实 Grok webhook 请求，受现有 gbb 每小时额度限制。达到最后一轮时仅允许最终回答，不执行新的工具批次。
+- `GBB_MAX_ROUNDS` 默认 8，允许 1–32；连续模式整次任务只有一次 Webhook，后续轮次是本机/SSH 工具结果交换。达到最后一轮时仅允许最终回答，不执行新的工具批次。无路由兼容模式仍使用逐轮 Webhook、累计 history 和 answer 回填。
+- 每次包装启动使用独立会话标识；重启后不会接续旧 Bot 运行，但同 task-id 的写操作仍由原 journal 防重。正常结束、错误及 SIGTERM 取消会关闭会话；掉电、SIGKILL 等无法执行清理时由请求截止时间兜底。两端和 Bot 提示词应一起升级。
 - 每批最多 8 个调用，顺序执行；失败后剩余调用不执行。需要上一步结果的调用分到下一轮。
 - 本任务内相同调用 ID 和相同写入内容会复用结果；同一任务重启时也读取本地记录。不同任务之间仍须先查询去重，不能承诺跨任务恰好一次。
 - 写操作超时、进程中断或响应损坏时可能已经生效。先回读状态，再决定下一步；包装不会自动重试写入或 webhook 请求。
@@ -114,8 +121,12 @@ GBB_REPLY
 | `answer_received` | 等待进程观察到回复；含 HTTP 返回后的等待耗时 |
 | `tool_start` / `tool_end` | 包装本地执行一项 Multica 工具；含 `ok` 与执行耗时 |
 | `answer_timeout` / `transport_error` | 等待超时或传输异常；异常只记录阶段及安全错误码 |
+| `continuation_published` | 新增结果已落盘并链接到上一轮；附 `previous_message_id`，不发送 Webhook |
+| `exchange_wait_start` / `exchange_wait_end` | 回填助手等待下一批结果；结束含 `state` 和等待耗时 |
+| `session_closed` | 包装关闭本次会话；含任务退出码 |
 
 用 `webhook_send_end → inbox_start` 查看触发确认到读取命令开始的间隔，`inbox_end → reply_start` 查看 Bot 处理区间，`reply_saved → answer_received` 查看本地回填唤醒延迟。多次读取可按同一 `message_id` 分别检查。`webhook_send_end` 仅表示 HTTP 确认，不能证明 Bot 已开始执行；Bot 也可能在 HTTP 返回前读取消息。
+连续模式后续轮次可用 `tool_end → continuation_published → exchange_wait_end(state=ready)` 分别查看结果发布与助手交付耗时，再用下一轮的 `reply_start` 查看 Bot 继续处理的区间。`exchange_wait_end` 是运行端输出完成，不代表云端已接收到输出。
 
 `inbox_end → reply_start` 仍包含 Bot 思考、Bot 内部工具和本地命令调度/连接等待，不能全部标成模型思考。此日志无法取得 Grok 云端排队、token 生成及 Bot 内部工具的独立时间。`elapsed_ms` 使用同进程单调时钟；跨进程节点间隔由 `ts` 计算，受系统校时及毫秒精度影响。并发追加的行顺序不保证等于事件时间顺序；错误或取消可能留下未配对的开始节点，以 `task_end` 的退出码判断结束。进程被强制杀死或主机掉电时也可能没有结束节点。升级只覆盖新启动的包装/endpoint，已有包装进程继续旧代码。
 

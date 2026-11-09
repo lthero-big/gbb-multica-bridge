@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
 AGENT = runpy.run_path(str(ROOT / 'gbb-multica-agent'))
+ENDPOINT = runpy.run_path(str(ROOT / 'gbb-multica-endpoint'))
 
 
 class ReliabilityTests(unittest.TestCase):
@@ -144,6 +145,55 @@ class ReliabilityTests(unittest.TestCase):
         result = self.reply('legacy response\n中文')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.path.read_text())['answer'], 'legacy response\n中文')
+
+    def continuous(self):
+        self.message['bridge'].update(task_id='test-task', session_id='c' * 32,
+                                      delivery_mode='continuous', round=1)
+        self.path.write_text(json.dumps(self.message))
+        AGENT['session_state'](self.store, 'c' * 32, task_id='test-task',
+                               instance='test-instance', status='running')
+        return json.dumps({'gbb_tool_protocol': 1, 'request_id': 'a' * 32,
+                           'tool_calls': [{'id': 'read', 'name': 'multica_help', 'arguments': {'command': []}}]})
+
+    def test_exchange_pending_duplicate_resume_and_closed_session(self):
+        reply = self.continuous()
+        ENDPOINT['save_reply'](self.config, self.message_id, reply, exchange=True)
+        before = self.path.read_bytes()
+        ENDPOINT['save_reply'](self.config, self.message_id, reply, exchange=True)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(ENDPOINT['wait_next'](self.config, self.message_id, 0)['state'], 'pending')
+        following = dict(self.message, id='mnext', question='only new results',
+                         bridge=dict(self.message['bridge'], round=2, request_id='b' * 32))
+        (self.path.parent / 'mnext.json').write_text(json.dumps(following))
+        message = json.loads(self.path.read_text())
+        message['bridge']['next_message_id'] = 'mnext'
+        self.path.write_text(json.dumps(message))
+        self.assertEqual(ENDPOINT['wait_next'](self.config, self.message_id, 0)['message'], following)
+        with self.assertRaisesRegex(ValueError, 'conflicting'):
+            ENDPOINT['save_reply'](self.config, self.message_id, reply.replace('"read"', '"other"'), exchange=True)
+        AGENT['session_state'](self.store, 'c' * 32, task_id='test-task', instance='test-instance', status='closed', exit_code=130)
+        with self.assertRaisesRegex(ValueError, 'session closed'):
+            ENDPOINT['save_reply'](self.config, 'mnext', 'late final')
+        message['bridge'].pop('next_message_id')
+        self.path.write_text(json.dumps(message))
+        self.assertEqual(ENDPOINT['wait_next'](self.config, self.message_id, 0)['exit_code'], 130)
+
+    def test_exchange_rejects_unsubmitted_cross_task_and_unsafe_successor(self):
+        reply = self.continuous()
+        with self.assertRaisesRegex(ValueError, 'before waiting'):
+            ENDPOINT['wait_next'](self.config, self.message_id, 0)
+        with self.assertRaises(ValueError):
+            ENDPOINT['save_reply'](self.config, self.message_id, 'plain final', exchange=True)
+        self.assertNotIn('answer', json.loads(self.path.read_text()))
+        ENDPOINT['save_reply'](self.config, self.message_id, reply, exchange=True)
+        for successor in ('../outside', 'mwrong'):
+            message = json.loads(self.path.read_text())
+            message['bridge']['next_message_id'] = successor
+            self.path.write_text(json.dumps(message))
+            (self.path.parent / 'mwrong.json').write_text(json.dumps(dict(self.message, id='mwrong',
+                bridge=dict(self.message['bridge'], task_id='another-task', round=2))))
+            with self.assertRaises(ValueError):
+                ENDPOINT['wait_next'](self.config, self.message_id, 0)
 
 
 if __name__ == '__main__':
