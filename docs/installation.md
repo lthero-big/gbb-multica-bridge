@@ -253,7 +253,23 @@ bash install.sh ssh --dry-run
 "$HOME/.local/bin/gbb-multica-remote" inbox host-alice
 ```
 
-升级时 `git pull` 后重跑安装向导或原命令。已有资源复用，变更的配置文件先备份；不会自动发测试消息。`runtime --check` 返回 2 表示 Multica 配置尚需修正，其他非零状态表示检查/权限/连接失败。
+0.5.2 提供检查与更新入口：
+
+```bash
+bash install.sh update --check  # 只读：查询 origin/main，显示本机组件的安装版本/提交
+bash install.sh update          # 快进源码，再用新版安装器重装本机已有运行端及所有回填路由
+~/.local/bin/gbb-multica --version
+~/.local/bin/gbb-multica update --check
+~/.local/bin/gbb-multica update
+```
+
+管理入口由 local / runtime / reply 安装成功后写入 `~/.local/bin/gbb-multica`，依赖原 Git 克隆目录。旧版首次升级仍需 `git pull --ff-only` 后重跑原安装命令；单独复制 `gbb-multica-setup.sh` 的安装不带源码更新器，需要先保留一份完整克隆。更新以项目 `origin/main` 的提交为准，没有后台自动升级。`--check` 使用 `git ls-remote`，不执行 fetch、不写 refs、不替换文件，检查成功返回 0；是否有更新在输出中说明，网络/权限失败返回非零，不会把失败说成“已是最新”。
+
+实际更新要求 origin 是本项目、当前处于干净的 `main`，拒绝本地修改、未跟踪文件、开发分支和非快进分叉；不会自动 stash、reset 或切换分支。检查更新和安装依旧是两个独立动作；命令启动时不会自动联网。更新复用 `server.json` 和 `routes.json` 的原实例、Bot、profile、工作区、SSH 连接及 endpoint；不会创建第二套部署，也不自动更新另一台机器。完整升级后仍需同步 Bot 的运行提示词。官方 Multica CLI 的升级是另一件事，可在普通终端使用 `multica update`，本项目不会代为升级或重启 daemon。
+
+运行端安装和新任务使用同一数据目录的共享/独占锁；活动任务或其他安装进程存在时停止升级。旧包装的运行通过已有 journal 锁检测；安装器同时补查已知 Agent 的活动状态，包括 dispatched 和 waiting_local_directory。安装期间新启动的包装会明确失败，避免混用正在替换的组件，因此应在任务空闲时操作。跨机器的回传端更新只替换该端本地助手，不替远端管理任务。各文件替换仍是逐个原子替换，不承诺整套部署事务回滚；中途失败保留已完成的操作和备份，修复原因后重跑更新命令。
+
+已有资源复用，变更的配置文件先备份；不会自动发测试消息。`runtime --check` 返回 2 表示 Multica 配置尚需修正，其他非零状态表示检查/权限/连接失败。
 
 `local` / `runtime` 安装及独立 `gbb-multica-setup.sh` 会将当前 `GBB_HOME/config.json` 中未设置或仍为旧默认 `12` 的 `maxPerHour` 更新为 `120`，先备份原配置，保留其他字段和不同数值的自定义限额。`--check` 仅提示需要更新，不修改配置。gbb 每次发送都会读取配置，无需重启；此限额按 Bot 统计最近一小时的发送次数，工具回合也占次数。单独安装上游 gbb 0.2.0 的默认值仍为 `12`，须完成本项目运行端配置才会更新。遇到 `notify.log` 的 `skip: rate limit …` 时先检查该限额与原 inbox，不要自动重发已失败的任务。
 

@@ -26,6 +26,7 @@ def check():
         }))
         for key in ("GBB_WEBHOOK_URL", "GBB_WEBHOOK_KEY", "GBB_WAIT"):
             env.pop(key, None)
+        env.pop("MULTICA_AGENT_ID", None)  # Keep this transport test offline; handoff has its own fake CLI tests.
         seen, mode, reply_delay = [], ["answer"], [0]
         received = threading.Event()
         errors = []
@@ -86,7 +87,7 @@ def check():
                 return [json.loads(line) for line in result.stdout.splitlines()]
 
             version = run("--version")
-            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.0"
+            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.2"
             assert not seen, "version must never send a request"
 
             config_before = Path(tmp, "config.json").read_bytes()

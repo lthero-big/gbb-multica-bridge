@@ -17,7 +17,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent
 MODULE = runpy.run_path(str(ROOT / "gbb-multica-agent"))
 Tools, parse_reply, BridgeError = (MODULE[x] for x in ("Tools", "parse_reply", "BridgeError"))
-REAL_CLI = shutil.which("multica")
+REAL_CLI = os.environ.get("MULTICA_CLI_PATH") or shutil.which("multica")
 FAKE_CLI = r'''#!/usr/bin/python3
 import json,os,sys
 from pathlib import Path
@@ -38,6 +38,11 @@ def val(flag,default=None):
 def finish(data,code=0):
  p.write_text(json.dumps(s))
  print(json.dumps(data,ensure_ascii=False));sys.exit(code)
+if a[:2]==['agent','tasks']: finish(s.get('tasks',[]))
+if a[:2]==['issue','runs']: finish({'runs':s.get('runs',[])})
+if a[:2]==['issue','run-messages']:
+ if s.get('deny_messages'): finish({'error':'denied'},3)
+ finish({'messages':s.get('messages',[])})
 if a[:2]==['project','list']: finish(s['projects'])
 if a[:2]==['project','create']:
  out={'id':'p1','title':val('--title'),'description':val('--description')}
@@ -88,6 +93,7 @@ class ToolTests(unittest.TestCase):
         self.state_file.write_text(json.dumps({"calls": [], "projects": [], "repos": [], "issues": []}))
         self.env = {"PATH": f"{self.bin}:/usr/bin:/bin", "LANG": "C.UTF-8",
                     "REAL_MULTICA_FOR_HELP": REAL_CLI, "FAKE_MULTICA_STATE": str(self.state_file),
+                    "MULTICA_CLI_PATH": str(exe),
                     "MULTICA_TOKEN": "mat_OFFLINE_TASK_CREDENTIAL_123456789",
                     "MULTICA_WORKSPACE_ID": "fake-workspace", "MULTICA_TASK_ID": "offline-task",
                     "GBB_HOME": str(self.root / "gbb"), "GBB_WAIT": "20",
@@ -109,6 +115,104 @@ class ToolTests(unittest.TestCase):
         self.counter += 1
         return self.tools.call({"id": call_id or f"c{self.counter}", "name": "multica",
                                "arguments": {"args": args, "files": files or {}}})
+
+    def prepare_handoff(self, task="offline-task"):
+        self.env["MULTICA_AGENT_ID"] = os.environ["MULTICA_AGENT_ID"] = "next-agent"
+        state = self.state()
+        current = {"id": task, "agent_id": "next-agent", "issue_id": "actual-issue",
+                   "created_at": "2026-11-09T02:00:00Z", "started_at": "2026-11-09T02:00:01Z", "status": "running"}
+        prior = {"id": "prior-task", "agent_id": "previous-agent", "issue_id": "actual-issue",
+                 "created_at": "2026-11-09T01:00:00Z", "started_at": "2026-11-09T01:00:01Z",
+                 "status": "failed", "result": {"output": "PR is ready; verify before retrying the interrupted write."}}
+        state.update(tasks=[current], runs=[current, prior], messages=[
+            {"seq": 1, "type": "tool_use", "tool": "multica", "call_id": "old-write", "input": {"args": ["issue", "update", "actual-issue"]}},
+            {"seq": 2, "type": "tool_result", "call_id": "old-write", "output_truncated": True,
+             "output": "result_id:original-result; " + self.env["MULTICA_TOKEN"] + " mat_PREVIOUS_TASK_SECRET_123456789 " + "中" * 4000},
+            {"seq": 3, "type": "text", "content": "HANDOFF_EVIDENCE"}])
+        self.state_file.write_text(json.dumps(state))
+
+    def test_handoff_uses_current_task_and_preserves_readable_provenance(self):
+        self.prepare_handoff()
+        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            context = self.tools.prior_context()  # Injected CLI must work even when PATH has no matching CLI.
+        self.assertEqual((context["status"], context["issue_id"], context["run_id"], context["agent_id"]),
+                         ("available", "actual-issue", "prior-task", "previous-agent"))
+        self.assertEqual(context["run_status"], "failed")
+        self.assertEqual(context["read_more"]["messages"], ["issue", "run-messages", "prior-task"])
+        self.assertTrue(context["truncated"])
+        encoded = json.dumps(context, ensure_ascii=False)
+        self.assertIn("original-result", encoded)
+        self.assertIn("HANDOFF_EVIDENCE", encoded)
+        self.assertNotIn(self.env["MULTICA_TOKEN"], encoded)
+        self.assertNotIn("PREVIOUS_TASK_SECRET", encoded)
+        self.assertTrue(context["messages"][1]["output_truncated"])
+        self.assertTrue(context["messages"][1]["excerpt_truncated"])
+        self.assertEqual(len(self.state()["calls"]), 3)
+        self.assertFalse(self.tools.calls, "history must not enter the new task's deduplication journal")
+
+    def test_handoff_total_limit_keeps_latest_evidence(self):
+        self.prepare_handoff()
+        state = self.state()
+        state["messages"] = [{"seq": i, "type": "text", "content": f"evidence-{i}:" + "中" * 5000} for i in range(100)]
+        self.state_file.write_text(json.dumps(state))
+        context = self.tools.prior_context()
+        self.assertLessEqual(len(json.dumps(context, ensure_ascii=False)), MODULE["PRIOR_CONTEXT_LIMIT"])
+        self.assertGreater(context["omitted_messages"], 88)
+        self.assertIn("evidence-99:", context["messages"][-1]["content"])
+
+    def test_handoff_missing_identity_chat_first_run_and_unmatched_task(self):
+        self.assertIsNone(self.tools.prior_context())
+        self.assertFalse(self.state()["calls"])
+        self.prepare_handoff()
+        state = self.state()
+        state["runs"] = state["tasks"]
+        self.state_file.write_text(json.dumps(state))
+        self.assertEqual(self.tools.prior_context()["status"], "none")
+        state = self.state()
+        state["tasks"][0]["issue_id"] = ""
+        self.state_file.write_text(json.dumps(state))
+        self.assertIsNone(self.tools.prior_context())
+        self.assertEqual(self.state()["calls"][-1][:2], ["agent", "tasks"])
+        state = self.state()
+        state["tasks"] = []
+        self.state_file.write_text(json.dumps(state))
+        self.assertEqual(self.tools.prior_context(), {"status": "unavailable", "missing": "current_task"})
+        self.tools.available = False
+        before = self.state()["calls"]
+        self.assertIsNone(self.tools.prior_context())
+        self.assertEqual(self.state()["calls"], before)
+
+    def test_handoff_access_failure_timeout_and_invalid_json_do_not_abort_task(self):
+        self.prepare_handoff()
+        state = self.state()
+        state["deny_messages"] = True
+        self.state_file.write_text(json.dumps(state))
+        context = self.tools.prior_context()
+        self.assertEqual((context["status"], context["missing"]), ("unavailable", "run_messages"))
+        self.assertIn("conclusion", context)
+        self.assertEqual(context["read_more"]["messages"][-1], "prior-task")
+        for failure in (subprocess.TimeoutExpired("hidden-secret", 1), OSError("hidden-secret")):
+            with patch.object(self.tools, "cli", side_effect=failure):
+                self.assertEqual(self.tools.prior_context(), {"status": "unavailable", "missing": "current_task"})
+        with patch.object(self.tools, "cli", return_value=(0, "invalid JSON hidden-secret", "")):
+            self.assertNotIn("hidden-secret", json.dumps(self.tools.prior_context()))
+
+    def test_handoff_skips_newer_concurrent_runs_and_queued_runs(self):
+        self.prepare_handoff()
+        state = self.state()
+        state["runs"].insert(0, {"id": "future-task", "created_at": "2026-11-09T03:00:00Z",
+                                 "started_at": "2026-11-09T03:00:01Z", "status": "running"})
+        state["runs"].insert(0, {"id": "queued-task", "created_at": "2026-11-09T01:59:00Z", "status": "queued"})
+        self.state_file.write_text(json.dumps(state))
+        self.assertEqual(self.tools.prior_context()["run_id"], "prior-task")
+
+    def test_malformed_run_metadata_reports_gap_instead_of_crashing(self):
+        self.prepare_handoff()
+        state = self.state()
+        del state["runs"][1]["id"]
+        self.state_file.write_text(json.dumps(state))
+        context = self.tools.prior_context()
+        self.assertEqual((context["status"], context["missing"]), ("unavailable", "issue_runs"))
 
     def test_create_edit_read_and_unicode_files(self):
         title = '项目 "引号" $HOME `touch unwanted` $(false)'
@@ -171,6 +275,10 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(self.state()["calls"], [])
 
     def test_redaction_403_and_bounded_comments(self):
+        nested = self.tools.redact({'token': 'opaque-value', 'auth': {'client_secret': 'client-value',
+                                    'private_key': 'private-value'}, 'title': 'ordinary title'})
+        self.assertEqual(nested, {'token': '[redacted]', 'auth': {'client_secret': '[redacted]',
+                                 'private_key': '[redacted]'}, 'title': 'ordinary title'})
         result = self.call(["agent", "get", "x"])
         self.assertNotIn("NEVER_FORWARD", json.dumps(result))
         self.assertNotIn(self.env["MULTICA_TOKEN"], json.dumps(result))
@@ -342,6 +450,7 @@ class ToolTests(unittest.TestCase):
             thread.join()
 
     def test_single_webhook_dynamic_exchange_has_only_new_results(self):
+        self.prepare_handoff("continuous-task")
         seen, messages, errors, duplicate_results = [], [], [], []
         bot_done = threading.Event()
         home = Path(self.env['GBB_HOME'])
@@ -376,6 +485,9 @@ class ToolTests(unittest.TestCase):
                 try:
                     message = helper('inbox', payload['message_id'])
                     initial = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
+                    if initial['remaining_requests']:
+                        self.assertEqual(initial['prior_context']['run_id'], 'prior-task')
+                        self.assertIn('HANDOFF_EVIDENCE', message['question'])
                     if initial['remaining_requests'] == 0:
                         closed = helper('exchange', message['id'], json.dumps({'gbb_tool_protocol': 1,
                             'request_id': initial['request_id'], 'tool_calls': [{'id': 'over_budget',
@@ -397,6 +509,8 @@ class ToolTests(unittest.TestCase):
                             self.assertNotIn(prompt, message['question'])
                             self.assertNotIn('user_task', request)
                             self.assertNotIn('history', request)
+                            self.assertNotIn('prior_context', request)
+                            self.assertNotIn('HANDOFF_EVIDENCE', message['question'])
                             self.assertEqual(len(request['tool_results']), 1)
                             self.assertEqual(request['tool_results'][0]['call_id'], operations[index - 1][0])
                         if call_id == 'edit':
@@ -454,7 +568,7 @@ class ToolTests(unittest.TestCase):
             before = self.state()['calls']
             bot_done.clear()
             limited = subprocess.run([sys.executable, str(ROOT / "gbb-multica-agent"), '-p', 'budgetcheck'],
-                env=dict(env, MULTICA_TASK_ID='continuous-budget', GBB_MAX_ROUNDS='1'),
+                env=dict(env, MULTICA_TASK_ID='continuous-budget', MULTICA_AGENT_ID='', GBB_MAX_ROUNDS='1'),
                 capture_output=True, text=True, timeout=8)
             self.assertEqual(limited.returncode, 2, limited.stderr)
             self.assertTrue(bot_done.wait(3))
