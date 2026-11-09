@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local deployment, runtime, reply and SSH setup; CLI and interactive wizard."""
 import argparse
+from contextlib import nullcontext
 import getpass
 import hashlib
 import json
@@ -20,6 +21,11 @@ import time
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
+VERSION = '0.5.2'
+UPSTREAM_URLS = ('https://github.com/lthero-big/gbb-multica-bridge.git',
+                 'https://github.com/lthero-big/gbb-multica-bridge',
+                 'git@github.com:lthero-big/gbb-multica-bridge.git',
+                 'ssh://git@github.com/lthero-big/gbb-multica-bridge.git')
 ARCHIVE_SHA256 = 'f5f2815bbaa272f34e0115b86b2344d7d60a0ce2546b8ee37765637b735e1b79'
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 
@@ -32,6 +38,77 @@ def require(value, message):
 
 def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, timeout=kwargs.pop("timeout", 120), **kwargs)
+
+
+def task_context():
+    return (os.environ.get('MULTICA_TOKEN', '').startswith('mat_') or
+            any(os.environ.get(k) for k in ('MULTICA_TASK_ID', 'MULTICA_AGENT_ID', 'MULTICA_TASK_CONFIG_ROOT')))
+
+
+def source_commit():
+    try:
+        result = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def install_manager(bin_dir):
+    # Keep the checkout as the update source; no downloaded shell or owner credentials.
+    command = [sys.executable, str(ROOT / 'install.py')]
+    source = '#!' + sys.executable + '\nimport os, sys\nos.execv(' + repr(sys.executable) + ', ' + repr(command) + ' + sys.argv[1:])\n'
+    write_file(bin_dir / 'gbb-multica', source, 0o755)
+
+
+def update(args, config_root, bin_dir):
+    require(args.check or not task_context(), '请在普通终端更新 Bridge；不能在 Multica 任务中替换运行程序')
+    require(shutil.which('git'), '检查更新需要 Git；请使用原克隆目录')
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+
+    def git(*command):
+        return run(['git', '-C', ROOT, *command], capture_output=True, text=True, env=env, timeout=30).stdout.strip()
+
+    require(Path(git('rev-parse', '--show-toplevel')).resolve() == ROOT, '请从完整的 Bridge Git 克隆目录更新')
+    require(git('remote', 'get-url', 'origin') in UPSTREAM_URLS,
+            'origin 不是本项目仓库，拒绝自动更新；请先核对 Git 远端')
+    current = git('rev-parse', 'HEAD')
+    dirty = bool(git('status', '--porcelain'))
+    latest = git('ls-remote', '--exit-code', 'origin', 'refs/heads/main').split()[0]
+    require(re.fullmatch(r'[0-9a-f]{40,64}', latest), '远端 main 未返回有效提交')
+    ancestor = subprocess.run(['git', '-C', str(ROOT), 'merge-base', '--is-ancestor', latest, current],
+                              capture_output=True, timeout=10).returncode == 0
+    server = read_config(config_root / 'server.json')
+    routes = read_config(config_root / 'routes.json')
+    print(f'Bridge 源码版本 {VERSION}；本地 {current[:12]}；远端 main {latest[:12]}')
+    print('源码状态：' + ('已包含远端 main' if ancestor else '存在远端更新，实际更新时核对快进关系'))
+    for label, config in (('运行端', server), ('回传端', routes)):
+        if config:
+            print(f'{label}已安装版本：{config.get("bridge_version", "未知（旧安装）")}；' +
+                  ('与远端提交一致' if config.get('source_commit') == latest else '可重装以同步源码'))
+    if dirty:
+        print('本地有未提交或未跟踪文件；更新会停止，保留这些文件。')
+    if args.check:
+        return 0
+    require(not dirty, '仓库不干净，未更新；请先提交或移走自己的修改')
+    require(git('symbolic-ref', '--short', 'HEAD') == 'main', '自动更新只用于 main；请先自行切换到 main，不会覆盖开发分支')
+    require(server or routes.get('routes'), '未找到已有部署配置；请先运行 local / runtime / reply 安装')
+    # Check before changing the checkout; the new installer checks again before replacing files.
+    if server:
+        shared = runpy.run_path(str(ROOT / 'gbb-multica-agent'))
+        with shared['deployment_lock'](Path(server['gbb_home']), exclusive=True):
+            pass
+    git('fetch', 'origin', 'main')
+    fetched = git('rev-parse', 'FETCH_HEAD')
+    git('merge', '--ff-only', fetched)
+    # Re-enter the updated installer, so upgrades use the NEW implementation.
+    command = [sys.executable, str(ROOT / 'install.py')]
+    if server:
+        run([*command, 'runtime', '--instance-id', server['instance_id']], timeout=600)
+    for route in routes.get('routes', {}):
+        run([*command, 'reply', '--route', route], timeout=120)
+    print('本机已配置组件更新完成。跨机部署还需在另一端运行同一更新命令，并按生成的提示词更新 Bot。')
+    return 0
 
 
 def write_file(path, content, mode=0o600):
@@ -155,8 +232,7 @@ def multica_json(shapes, base, *command):
 
 def runtime(args, config_root, bin_dir):
     require(platform.system() in ('Linux', 'Darwin'), '运行端支持 Linux/macOS')
-    task = (os.environ.get('MULTICA_TOKEN', '').startswith('mat_') or
-            any(os.environ.get(k) for k in ('MULTICA_TASK_ID', 'MULTICA_AGENT_ID', 'MULTICA_TASK_CONFIG_ROOT')))
+    task = task_context()
     require(not task or args.check, '请在 daemon 用户已登录 Multica 的普通终端执行，不能借用聊天任务凭证安装')
     previous = read_config(config_root / 'server.json')
     instance = safe_name(args.instance_id or previous.get('instance_id') or
@@ -202,6 +278,9 @@ def runtime(args, config_root, bin_dir):
     if workspace:
         setup += ['--workspace-id', workspace]
     env = dict(os.environ, PATH=str(prefix / 'bin') + os.pathsep + os.environ.get('PATH', ''), GBB_HOME=str(home))
+    lock_fd = getattr(args, 'install_lock_fd', None)
+    if lock_fd is not None:
+        env['GBB_MULTICA_INSTALL_LOCK_FD'] = str(lock_fd)
     if args.check:
         require(gbb.exists(), '尚未安装此脚本管理的 gbb 0.2.0；先安装运行端（runtime）')
         return subprocess.run(setup + ['--check'], env=env, timeout=120).returncode
@@ -211,13 +290,13 @@ def runtime(args, config_root, bin_dir):
     require(version == '0.2.0', '安装后 gbb 版本不是 0.2.0')
     configure_credentials(node, gbb, home, bot)
     # This script verifies the daemon owner and guards active Agent tasks before registration.
-    run(setup, env=env, timeout=600)
+    run(setup, env=env, timeout=600, pass_fds=(lock_fd,) if lock_fd is not None else ())
     endpoint = install_executable('gbb-multica-endpoint', bin_dir)
     install_executable('gbb-multica-setup.sh', bin_dir)
     saved = dict(instance_id=instance, bot=bot, gbb_home=str(home), gbb_bin=str(gbb),
                  node_bin=node, wrapper=str(bin_dir / 'gbb-multica-agent'), user=pwd.getpwuid(os.geteuid()).pw_name,
                  profile=profile, workspace_id=workspace, reply_route=route, agent_name=agent,
-                 archive_sha256=ARCHIVE_SHA256)
+                 archive_sha256=ARCHIVE_SHA256, bridge_version=VERSION, source_commit=source_commit())
     write_file(config_root / 'server.json', json.dumps(saved, ensure_ascii=False, indent=2) + '\n')
     run([endpoint, '--instance-id', instance, 'check'])
     print(f'运行端安装完成。回填路由：{route}；实例：{instance}')
@@ -332,6 +411,7 @@ def reply(args, config_root, bin_dir):
         return 0
     helper = install_executable('gbb-multica-remote', bin_dir)
     routes[route_name] = item
+    config.update(bridge_version=VERSION, source_commit=source_commit())
     write_file(config_root / 'routes.json', json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     prompt = config_root / 'grok-bot-prompt.md'
     content = prompt_for_routes(routes, helper, item['bot'])
@@ -506,18 +586,21 @@ def build_parser():
   bash install.sh reply --route host-alice --transport local --bot bridge
   bash install.sh reply --route host-alice --ssh-alias multica-alice --bot bridge
   bash install.sh ssh --ssh-alias multica-alice --ssh-host example.com --ssh-user alice
+  bash install.sh update --check          # 只读查询远端 main 和已安装版本
+  bash install.sh update                  # 快进更新并重装本机已有组件
 
 local / runtime / reply / ssh 支持 Linux、macOS。本机同用户部署选 local，无需 SSH。
 旧 server / mac 命令分别是 runtime / reply 的兼容别名。
 --profile 选择已有 Multica 登录配置；省略使用当前配置，无需新建 profile。
 更多参数与同机/跨机示例见 README.md。''')
-    parser.add_argument('mode', nargs='?', choices=('local', 'runtime', 'reply', 'ssh', 'server', 'mac'),
-                        help='local=本机一体部署；runtime=运行端；reply=回传端；ssh=独立免密配置；省略进入菜单')
+    parser.add_argument('--version', action='version', version='gbb-multica ' + VERSION)
+    parser.add_argument('mode', nargs='?', choices=('local', 'runtime', 'reply', 'ssh', 'server', 'mac', 'update'),
+                        help='local=本机一体部署；runtime=运行端；reply=回传端；ssh=独立免密配置；update=检查/更新；省略进入菜单')
     common = parser.add_argument_group('通用')
     common.add_argument('--interactive', '-i', action='store_true', help='逐项询问配置并确认；可以预填其他参数')
     common.add_argument('--instance-id', metavar='INSTANCE', help='运行端稳定标识；默认主机名-用户名；回传端默认 route')
     common.add_argument('--bot', metavar='BOT', help='运行端的 gbb Bot alias / 回传端提示词标注；默认 bridge-实例名')
-    common.add_argument('--check', action='store_true', help='只读检查；不发送 Grok 请求；SSH 模式仅验证免密登录')
+    common.add_argument('--check', action='store_true', help='只读检查；update 只查询远端版本，SSH 模式仅验证免密登录；不发送 Grok 请求')
     common.add_argument('--dry-run', action='store_true', help='仅展示步骤；不连接、不写文件')
     runtime_options = parser.add_argument_group('本机部署 local / 运行端 runtime')
     runtime_options.add_argument('--profile', help='已有 Multica 登录配置；默认当前配置，不创建 profile')
@@ -540,6 +623,10 @@ local / runtime / reply / ssh 支持 Linux、macOS。本机同用户部署选 lo
 
 
 def validate_args(parser, args):
+    if args.mode == 'update' and any(getattr(args, name) for name in
+            ('instance_id', 'bot', 'profile', 'workspace_id', 'reply_route', 'agent_name', 'gbb_home',
+             'route', 'transport', 'endpoint', 'ssh_alias', 'setup_ssh', 'ssh_host', 'ssh_user', 'ssh_port', 'ssh_key', 'interactive')):
+        parser.error('update 复用已保存配置，只接受 --check / --dry-run')
     connection_options = any(value is not None for value in (args.ssh_host, args.ssh_user, args.ssh_port, args.ssh_key))
     if args.mode == 'reply' and any(value is not None for value in
             (args.profile, args.workspace_id, args.reply_route, args.agent_name, args.gbb_home)):
@@ -570,7 +657,7 @@ def main():
     validate_args(parser, args)
     require(sys.version_info >= (3, 9), '需要 Python 3.9+')
     config_root = Path(os.environ.get('GBB_MULTICA_CONFIG_HOME', str(Path.home() / '.config/gbb-multica'))).expanduser()
-    interactive = args.interactive or args.mode is None or (len(sys.argv) == 2 and sys.stdin.isatty())
+    interactive = args.mode != 'update' and (args.interactive or args.mode is None or (len(sys.argv) == 2 and sys.stdin.isatty()))
     if interactive:
         if not wizard(args, config_root):
             return 0
@@ -579,10 +666,24 @@ def main():
         print({'local': '本机部署：安装运行端 → 注册 runtime/Agent → 本机 endpoint → 本机回传路由 → Bot 提示词；无需 SSH',
                'runtime': '运行端：校验 gbb 0.2.0 → 用户目录安装 → 配置已有 Bot → 检查 daemon → 注册 runtime/Agent → 安装 endpoint',
                'reply': '回传端：选择本机/SSH → 核对运行端实例 → 安装回填助手 → 合并路由 → 生成 Bot 提示词',
-               'ssh': 'SSH：生成/复用密钥 → 必要时一次密码登录追加公钥 → 验证免密 → 保存独立连接'}[args.mode])
+               'ssh': 'SSH：生成/复用密钥 → 必要时一次密码登录追加公钥 → 验证免密 → 保存独立连接',
+               'update': '更新：只读查询 origin/main → 核对干净 main 和忙碌状态 → 快进 → 用新安装器重装本机已有组件'}[args.mode])
         return 0
     os.umask(0o077)
-    return {'local': local, 'runtime': runtime, 'reply': reply, 'ssh': ssh}[args.mode](args, config_root, Path.home() / '.local/bin')
+    guard = nullcontext()
+    if args.mode in ('local', 'runtime') and not args.check:
+        require(not task_context(), '请在普通终端安装；不能借用 Multica 任务凭证')
+        saved = read_config(config_root / 'server.json')
+        home = Path(args.gbb_home or saved.get('gbb_home') or str(Path.home() / '.grok-bot-bridge')).expanduser().resolve()
+        guard = runpy.run_path(str(ROOT / 'gbb-multica-agent'))['deployment_lock'](home, exclusive=True)
+    with guard as lock:
+        if lock is not None:
+            args.install_lock_fd = lock.fileno()
+        result = {'local': local, 'runtime': runtime, 'reply': reply, 'ssh': ssh, 'update': update}[args.mode](
+            args, config_root, Path.home() / '.local/bin')
+        if result == 0 and not args.check and args.mode in ('local', 'runtime', 'reply', 'update'):
+            install_manager(Path.home() / '.local/bin')
+        return result
 
 
 if __name__ == '__main__':

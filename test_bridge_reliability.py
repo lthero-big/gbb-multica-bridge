@@ -59,6 +59,23 @@ class ReliabilityTests(unittest.TestCase):
         with patch.dict(os.environ, GBB_TARGET_BOT='specialist'):
             self.assertEqual(AGENT['bridge_settings']()[0], 'specialist')
 
+    def test_installation_excludes_all_store_tasks_and_validates_inherited_lock(self):
+        acquire = AGENT['deployment_lock']
+        with acquire(self.store):
+            with acquire(self.store):
+                with self.assertRaisesRegex(ValueError, 'active task'):
+                    acquire(self.store, exclusive=True)
+        with acquire(self.store, exclusive=True) as installer:
+            with self.assertRaisesRegex(ValueError, 'active task'):
+                acquire(self.store)
+            with acquire(self.store, exclusive=True, inherited_fd=installer.fileno()):
+                pass
+            with tempfile.TemporaryFile() as unrelated:
+                with self.assertRaisesRegex(ValueError, 'mismatch'):
+                    acquire(self.store, exclusive=True, inherited_fd=unrelated.fileno())
+        with acquire(self.store):
+            pass
+
     def test_partial_route_corrupt_config_workspace_and_store_mismatch_fail_closed(self):
         for env in ({'GBB_INSTANCE_ID': 'test-instance'}, {'GBB_REPLY_ROUTE': 'test-route'},
                     {'MULTICA_WORKSPACE_ID': 'other'}, {'GBB_HOME': str(self.root / 'other')}):

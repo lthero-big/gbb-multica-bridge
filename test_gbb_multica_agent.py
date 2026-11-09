@@ -87,7 +87,7 @@ def check():
                 return [json.loads(line) for line in result.stdout.splitlines()]
 
             version = run("--version")
-            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.1"
+            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.2"
             assert not seen, "version must never send a request"
 
             config_before = Path(tmp, "config.json").read_bytes()

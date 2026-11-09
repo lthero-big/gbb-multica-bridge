@@ -91,6 +91,10 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         cls.tmp.cleanup()
 
     def test_server_offline_install_replay_and_check(self):
+        self.assertEqual(self.server['bridge_version'], INSTALL['VERSION'])
+        manager = self.alice / '.local/bin/gbb-multica'
+        version = subprocess.run([str(manager), '--version'], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(version.stdout.strip(), 'gbb-multica ' + INSTALL['VERSION'])
         config_path = Path(self.server['gbb_home']) / 'config.json'
         config = json.loads(config_path.read_text())
         self.assertEqual(config['maxPerHour'], 120)
@@ -119,6 +123,17 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         self.assertEqual(after['writes'].count('agent.create'), 1)
         self.assertEqual(after['writes'].count('profile.create'), 1)
         self.assertEqual(hashlib.sha256((ROOT / 'vendor/grok-bot-bridge-0.2.0.tgz').read_bytes()).hexdigest(), INSTALL['ARCHIVE_SHA256'])
+
+    def test_active_store_blocks_installer_before_changing_binaries(self):
+        acquire = runpy.run_path(str(ROOT / 'gbb-multica-agent'))['deployment_lock']
+        wrapper = Path(self.server['wrapper'])
+        before, state = wrapper.read_bytes(), self.state.read_bytes()
+        with acquire(Path(self.server['gbb_home'])):
+            result = subprocess.run(self.command, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('active task', result.stderr)
+        self.assertEqual(wrapper.read_bytes(), before)
+        self.assertEqual(self.state.read_bytes(), state)
 
     def test_server_install_tolerates_multica_output_shapes(self):
         # 0.6.5 wraps `agent env get` in custom_env; a future CLI may wrap every response.

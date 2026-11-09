@@ -164,7 +164,7 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             wrapper=install_dir/"gbb-multica-agent"
             assert os.access(wrapper,os.X_OK)
             version=subprocess.run([str(wrapper),"--version"],env=env,capture_output=True,text=True,check=True)
-            assert version.stdout.strip()=="gbb-multica-agent 0.5.1"
+            assert version.stdout.strip()=="gbb-multica-agent 0.5.2"
             passed(run())
             assert list(home.glob("config.json.bak-*")) == backups, "reinstall must not rewrite an updated limit"
             second=state()
@@ -219,10 +219,11 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             reset()
             (home/"credentials.json").unlink()
             assert run().returncode==1 and state()["writes"]==[]
-            reset(rate_limit=12, profiles=[profile.copy()],agents=[agent.copy()],runs=[{"status":"running"}])
-            before_config = config_path.read_bytes()
-            assert run().returncode==1 and state()["writes"]==[]
-            assert config_path.read_bytes() == before_config, "active-task guard must precede rate-limit migration"
+            for active_status in ("running", "dispatched", "waiting_local_directory"):
+                reset(rate_limit=12, profiles=[profile.copy()],agents=[agent.copy()],runs=[{"status":active_status}])
+                before_config = config_path.read_bytes()
+                assert run().returncode==1 and state()["writes"]==[], active_status
+                assert config_path.read_bytes() == before_config, "active-task guard must precede rate-limit migration"
 
             reset(daemon_pid=0)
             assert run().returncode==1 and state()["writes"]==[]

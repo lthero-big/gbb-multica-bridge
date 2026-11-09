@@ -206,6 +206,14 @@ class ToolTests(unittest.TestCase):
         self.state_file.write_text(json.dumps(state))
         self.assertEqual(self.tools.prior_context()["run_id"], "prior-task")
 
+    def test_malformed_run_metadata_reports_gap_instead_of_crashing(self):
+        self.prepare_handoff()
+        state = self.state()
+        del state["runs"][1]["id"]
+        self.state_file.write_text(json.dumps(state))
+        context = self.tools.prior_context()
+        self.assertEqual((context["status"], context["missing"]), ("unavailable", "issue_runs"))
+
     def test_create_edit_read_and_unicode_files(self):
         title = '项目 "引号" $HOME `touch unwanted` $(false)'
         p = self.call(["project", "create", "--title", title])
@@ -267,6 +275,10 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(self.state()["calls"], [])
 
     def test_redaction_403_and_bounded_comments(self):
+        nested = self.tools.redact({'token': 'opaque-value', 'auth': {'client_secret': 'client-value',
+                                    'private_key': 'private-value'}, 'title': 'ordinary title'})
+        self.assertEqual(nested, {'token': '[redacted]', 'auth': {'client_secret': '[redacted]',
+                                 'private_key': '[redacted]'}, 'title': 'ordinary title'})
         result = self.call(["agent", "get", "x"])
         self.assertNotIn("NEVER_FORWARD", json.dumps(result))
         self.assertNotIn(self.env["MULTICA_TOKEN"], json.dumps(result))

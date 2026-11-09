@@ -37,7 +37,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 PRIOR_CONTEXT_LIMIT = 12000
 GBB_BIN = "/usr/bin/gbb"
 NODE_BIN = "node"
@@ -100,6 +100,7 @@ BLOCKED_FLAGS = {
 FILE_FLAGS = {"--content-file", "--description-file", "--instruction-file", "--attachment"}
 SECRET_FIELDS = re.compile(
     r"^(custom_env|mcp_config|runtime_config|credentials?|password|authorization|"
+    r"token|secret|private_key|client_secret|signing_key|"
     r"headers|env|api_key|access_token|refresh_token|webhook_(token|url|path|secret))$", re.I)
 
 # Reuse gbb's store, credentials and rate limiter, with an explicit
@@ -454,6 +455,37 @@ def project_fields(data, fields):
     return data
 
 
+def deployment_lock(home, *, exclusive=False, inherited_fd=None):
+    """Tasks share the store; installers exclude tasks and other installers."""
+    home = Path(home)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = home / 'deployment.lock'
+    if path.is_symlink():
+        raise ValueError('deployment lock must not be a symlink')
+    if inherited_fd is not None:
+        fd = int(inherited_fd)
+        actual, expected = os.fstat(fd), path.stat()
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError('inherited deployment lock mismatch')
+        lock = os.fdopen(os.dup(fd), 'a')
+    else:
+        lock = path.open('a')
+    try:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        if exclusive:
+            # Older wrappers do not take the store lock, but hold their task journal lock.
+            for old in home.glob('multica-runs/*/lock'):
+                with old.open('a') as previous:
+                    fcntl.flock(previous, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock
+    except BaseException as exc:
+        lock.close()
+        if isinstance(exc, BlockingIOError):
+            raise ValueError('Bridge has an active task or installation; finish it before updating') from None
+        raise
+
+
 class Tools:
     def __init__(self, deadline, journal_dir):
         self.deadline = deadline
@@ -470,6 +502,7 @@ class Tools:
         except (OSError, ValueError, AttributeError):
             pass
         journal_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.deployment = deployment_lock(journal_dir.parent.parent)
         self.lock = (journal_dir / "lock").open("a")
         os.chmod(journal_dir / "lock", 0o600)
         try:
@@ -492,6 +525,7 @@ class Tools:
     def close(self):
         self.audit.close()
         self.lock.close()
+        self.deployment.close()
 
     def redact(self, value):
         if isinstance(value, dict):
@@ -548,15 +582,22 @@ class Tools:
             current = next((r for r in tasks if r.get("id") == task and r.get("agent_id") == agent), None)
             if current is None:
                 raise ValueError("current task not in bounded lookup")
+            if not isinstance(current.get("created_at"), str):
+                raise ValueError("current task timestamp unavailable")
             issue = current.get("issue_id")
             if not issue:  # Chats have no issue; do not harvest unrelated chat history.
                 return None
+            if not isinstance(issue, str):
+                raise ValueError("invalid current issue identity")
             context.update(issue_id=issue, truncated=False, read_more={
                 "issue": ["issue", "get", issue],
                 "runs": ["issue", "runs", issue],
                 "comments": ["issue", "comment", "list", issue, "--roots-only", "--summary"]})
             stage = "issue_runs"
             runs = multica_rows(read(["issue", "runs", issue]), "issue runs", ("runs", "executions"))
+            for row in runs:
+                if not all(isinstance(row.get(k), str) for k in ("id", "created_at", "status")):
+                    raise ValueError("invalid run metadata")
             prior = [r for r in runs if r.get("id") != task and r.get("started_at") and
                      r.get("created_at", "") <= current.get("created_at", "") and
                      r.get("status") in ("completed", "failed", "cancelled", "running")]
@@ -908,7 +949,7 @@ def main():
         try:
             code, output, _ = transport({"check": True}, 10)
             if output.strip():
-                print(output.strip())
+                print(json.dumps({**json.loads(output), "bridge_version": VERSION}))
             return code if code > 0 else (1 if code < 0 else 0)
         except (OSError, subprocess.TimeoutExpired):
             print("GBB check failed: node/gbb module loading unavailable or timed out", file=sys.stderr)
@@ -1052,6 +1093,7 @@ MulticaShapeError = _SHARED["MulticaShapeError"]
 multica_rows, multica_object, multica_env = _SHARED["multica_rows"], _SHARED["multica_object"], _SHARED["multica_env"]
 multica_field, multica_daemon, multica_int = _SHARED["multica_field"], _SHARED["multica_daemon"], _SHARED["multica_int"]
 multica_help_flags = _SHARED["multica_help_flags"]
+deployment_lock = _SHARED["deployment_lock"]
 PROFILE_NAME = "Grok Bot Bridge"
 WRAPPER_NAME = "gbb-multica-agent"
 TOOL_INSTRUCTIONS = (
@@ -1330,10 +1372,11 @@ def main():
         print("需要配置：" + "；".join(needs) if needs else "检测通过：本机绑定、包装和可核对配置均匹配。")
         return 2 if needs else 0
 
+    store_lock = deployment_lock(gbb_home, exclusive=True, inherited_fd=os.environ.get("GBB_MULTICA_INSTALL_LOCK_FD"))
     if agent:
-        runs = multica_rows(cli("agent tasks", agent["id"], "--limit", "10"), "agent tasks", ("tasks", "runs"))
+        runs = multica_rows(cli("agent tasks", agent["id"], "--limit", "200"), "agent tasks", ("tasks", "runs"))
         require(not any(str(multica_field(r, "status", "state", default="")).lower() in
-                        ("pending", "queued", "running", "waiting", "in_progress") for r in runs),
+                        ("pending", "queued", "dispatched", "running", "waiting", "waiting_local_directory", "in_progress") for r in runs),
                 "测试 agent 仍有进行中的请求，请先完成回填或取消，再运行配置脚本。")
     lock_dir = Path(daemon_user.pw_dir) / ".local/state/gbb-multica"
     lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1382,7 +1425,7 @@ def main():
         finally:
             Path(temp_name).unlink(missing_ok=True)
     version = subprocess.run([str(wrapper), "--version"], capture_output=True, text=True, timeout=10)
-    require(version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.1", "包装版本检查失败。")
+    require(version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.2", "包装版本检查失败。")
 
     # Re-read after acquiring the lock to avoid duplicate local creations.
     profile = profile_named(opts.runtime_profile_name)
@@ -1449,7 +1492,7 @@ def main():
 
 try:
     raise SystemExit(main())
-except (SetupError, MulticaShapeError, OSError, subprocess.SubprocessError) as exc:
+except (SetupError, MulticaShapeError, ValueError, OSError, subprocess.SubprocessError) as exc:
     print(f"配置停止：{exc}", file=sys.stderr)
     raise SystemExit(1)
 GBB_SETUP_PY
