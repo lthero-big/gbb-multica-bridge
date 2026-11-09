@@ -221,6 +221,8 @@ def main():
             return checked.returncode
         result = json.loads(checked.stdout)
         result.update(instance_id=config['instance_id'], user=config['user'], gbb_home=config['gbb_home'])
+        result.update(source_commit=config.get('source_commit'), management=config.get('management'),
+                      protocol=1, actions=['inbox', 'answer', 'fail', 'exchange', 'wait'])
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.action == 'inbox' and args.message_id:

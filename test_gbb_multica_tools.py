@@ -133,32 +133,39 @@ class ToolTests(unittest.TestCase):
 
     def test_handoff_uses_current_task_and_preserves_readable_provenance(self):
         self.prepare_handoff()
+        state = self.state()
+        state['runs'][1]['result']['output'] += self.env['MULTICA_TOKEN']
+        state['deny_messages'] = True
+        self.state_file.write_text(json.dumps(state))
         with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
-            context = self.tools.prior_context()  # Injected CLI must work even when PATH has no matching CLI.
+            context = self.tools.prior_context()
         self.assertEqual((context["status"], context["issue_id"], context["run_id"], context["agent_id"]),
-                         ("available", "actual-issue", "prior-task", "previous-agent"))
+                         ("summary_only", "actual-issue", "prior-task", "previous-agent"))
         self.assertEqual(context["run_status"], "failed")
         self.assertEqual(context["read_more"]["messages"], ["issue", "run-messages", "prior-task"])
-        self.assertTrue(context["truncated"])
-        encoded = json.dumps(context, ensure_ascii=False)
-        self.assertIn("original-result", encoded)
-        self.assertIn("HANDOFF_EVIDENCE", encoded)
-        self.assertNotIn(self.env["MULTICA_TOKEN"], encoded)
-        self.assertNotIn("PREVIOUS_TASK_SECRET", encoded)
-        self.assertTrue(context["messages"][1]["output_truncated"])
-        self.assertTrue(context["messages"][1]["excerpt_truncated"])
-        self.assertEqual(len(self.state()["calls"]), 3)
+        self.assertEqual(context['messages_status'], 'not_loaded')
+        self.assertIn('PR is ready', context['conclusion'])
+        self.assertNotIn(self.env['MULTICA_TOKEN'], json.dumps(context))
+        self.assertEqual(len(self.state()["calls"]), 2)
         self.assertFalse(self.tools.calls, "history must not enter the new task's deduplication journal")
 
-    def test_handoff_total_limit_keeps_latest_evidence(self):
+    def test_huge_transcript_is_never_requested_and_summary_is_bounded(self):
         self.prepare_handoff()
         state = self.state()
-        state["messages"] = [{"seq": i, "type": "text", "content": f"evidence-{i}:" + "中" * 5000} for i in range(100)]
+        state['runs'][1]['result']['output'] = 'SUMMARY_START' + '中' * 100000 + 'SUMMARY_END'
+        state['messages'] = [{"seq": i, "type": "text", "content": "中" * 5000} for i in range(1000)]
         self.state_file.write_text(json.dumps(state))
-        context = self.tools.prior_context()
+        original = self.tools.cli
+        def bounded_read(args, **kwargs):
+            self.assertNotEqual(args[:2], ['issue', 'run-messages'], 'startup must never download the full log')
+            return original(args, **kwargs)
+        with patch.object(self.tools, 'cli', side_effect=bounded_read):
+            context = self.tools.prior_context()
         self.assertLessEqual(len(json.dumps(context, ensure_ascii=False)), MODULE["PRIOR_CONTEXT_LIMIT"])
-        self.assertGreater(context["omitted_messages"], 88)
-        self.assertIn("evidence-99:", context["messages"][-1]["content"])
+        self.assertTrue(context['truncated'])
+        self.assertIn('SUMMARY_START', context['conclusion'])
+        self.assertIn('SUMMARY_END', context['conclusion'])
+        self.assertEqual(context['messages_status'], 'not_loaded')
 
     def test_handoff_missing_identity_chat_first_run_and_unmatched_task(self):
         self.assertIsNone(self.tools.prior_context())
@@ -184,13 +191,11 @@ class ToolTests(unittest.TestCase):
 
     def test_handoff_access_failure_timeout_and_invalid_json_do_not_abort_task(self):
         self.prepare_handoff()
-        state = self.state()
-        state["deny_messages"] = True
-        self.state_file.write_text(json.dumps(state))
-        context = self.tools.prior_context()
-        self.assertEqual((context["status"], context["missing"]), ("unavailable", "run_messages"))
-        self.assertIn("conclusion", context)
-        self.assertEqual(context["read_more"]["messages"][-1], "prior-task")
+        with patch.object(self.tools, 'cli', side_effect=[(0, json.dumps(self.state()['tasks']), ''),
+                                                         subprocess.TimeoutExpired('hidden-secret', 1)]):
+            context = self.tools.prior_context()
+        self.assertEqual((context["status"], context["missing"]), ("unavailable", "issue_runs"))
+        self.assertIn('read_more', context)
         for failure in (subprocess.TimeoutExpired("hidden-secret", 1), OSError("hidden-secret")):
             with patch.object(self.tools, "cli", side_effect=failure):
                 self.assertEqual(self.tools.prior_context(), {"status": "unavailable", "missing": "current_task"})
@@ -487,7 +492,13 @@ class ToolTests(unittest.TestCase):
                     initial = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
                     if initial['remaining_requests']:
                         self.assertEqual(initial['prior_context']['run_id'], 'prior-task')
-                        self.assertIn('HANDOFF_EVIDENCE', message['question'])
+                        self.assertEqual(initial['prior_context']['messages_status'], 'not_loaded')
+                        self.assertIn('PR is ready', initial['prior_context']['conclusion'])
+                        self.assertNotIn('HANDOFF_EVIDENCE', message['question'])
+                        self.assertEqual(initial['bridge_version'], MODULE['VERSION'])
+                        self.assertEqual(initial['protocol_revision'], hashlib.sha256(MODULE['INSTRUCTIONS'].encode()).hexdigest())
+                        self.assertEqual(message['reply_commands']['exchange'],
+                                         [str(ROOT / 'gbb-multica-remote'), 'exchange', 'offline-route', message['id'], '-'])
                     if initial['remaining_requests'] == 0:
                         closed = helper('exchange', message['id'], json.dumps({'gbb_tool_protocol': 1,
                             'request_id': initial['request_id'], 'tool_calls': [{'id': 'over_budget',
@@ -505,6 +516,7 @@ class ToolTests(unittest.TestCase):
                         messages.append(message)
                         request = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
                         self.assertEqual(request['delivery_mode'], 'continuous')
+                        self.assertEqual(message['reply_commands']['answer'][-2:], [message['id'], '-'])
                         if index:
                             self.assertNotIn(prompt, message['question'])
                             self.assertNotIn('user_task', request)

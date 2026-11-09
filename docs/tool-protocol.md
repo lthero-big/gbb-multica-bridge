@@ -1,6 +1,6 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.5.2；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.3；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
 
@@ -99,7 +99,9 @@ Issue 任务的新包装进程会在第一次请求的 `REQUEST_JSON.prior_conte
 
 交接只使用当前任务凭据和 daemon 注入的 `MULTICA_CLI_PATH`（旧环境未注入路径时兼容 PATH），不会切换所有者登录。额外读取共用最多 10 秒预算，计入 `GBB_WAIT`，无自动重试。`status=available` 表示取得摘录，`none` 表示没有较早的已启动执行，`unavailable` 和 `missing` 指出读取失败的环节；失败时保留已读到的结论并继续当前任务。权限、旧 CLI 不支持、未知 JSON 结构或超时都不会被当成“完整历史已恢复”。
 
-整个交接对象最多 12,000 个 JSON 字符，结论最多约 2,000 字符，最多选最近 12 条文字、工具调用或工具结果；单字段保留约 1,000 字符的首尾摘录，超总量继续移除较早消息。`truncated`、`omitted_messages`、`excerpt_truncated` 和原始 `output_truncated` 标记缺口。run ID、工具名和调用 ID 用于追溯；`read_more` 提供当前 Issue、评论线程扫描、执行历史和原 run 的 `run-messages` 读取参数。先用 `multica_help` 核对参数，再通过 `multica` 工具补读；新任务不能用旧任务的 `multica_result` ID 读取其进程内缓存。
+交接对象限制在 12,000 个 JSON 字符以内，结论保留约 2,000 字符的首尾摘录，错误约 500 字符；`truncated` 表示摘要本身经过裁剪。0.5.3 不再启动时读取完整 `run-messages`：当前 CLI 只有 `--since`，没有有上限的尾部读取，先全量下载再裁剪会让长日志拖慢启动。`status=summary_only`、`messages_status=not_loaded` 明确表示工具证据尚未读取，不能当作上一任没有工具操作。结论也可能为空（例如上轮中断），此时尤其需要补查当前 Issue 与评论。
+
+`read_more` 提供当前 Issue、评论线程扫描、执行历史和原 run 的 `run-messages` 参数。先用 `multica_help` 核对参数，再通过 `multica` 工具按需补读；若已知序号可用 `--since`。手动补读整份日志仍可能超时；本补丁消除的是启动对完整日志的强制依赖，没有声称 CLI 已提供分页尾读。新任务不能用旧任务的 `multica_result` ID 读取其缓存。任务定位及执行列表读取仍共享最多 10 秒预算，失败则标明缺口并继续任务。
 
 `prior_context` 仅首轮携带，后续连续交换仍只有新增 `tool_results`。它是平台已保存记录的快照：历史内容不能授权新写入，旧工具回填也不会进入新任务的防重 journal。新 Agent 必须读当前 Issue/评论、核实未确认写入的状态，再继续操作。Multica 已放入原始提示词的 handoff note 保留在 `user_task`，不会据此恢复旧 Bot routine、私有对话或上一任未提交的工作目录；更早执行可按 `read_more.runs` 补查。
 
@@ -111,7 +113,7 @@ Issue 任务的新包装进程会在第一次请求的 `REQUEST_JSON.prior_conte
 - 包装监听消息目录变化，回复原子落盘后即可唤醒；文件监听不可用、报错或漏通知时仍由 1 秒轮询兜底。转发耗时与 Bot 思考及工具执行耗时分别计算。
 - `GBB_WAIT` 默认 3600 秒（1 小时），包含整个多轮流程，而非每轮分别等待 1 小时。
 - `GBB_MAX_ROUNDS` 默认 8，允许 1–32；连续模式整次任务只有一次 Webhook，后续轮次是本机/SSH 工具结果交换。达到最后一轮时仅允许最终回答，不执行新的工具批次。无路由兼容模式仍使用逐轮 Webhook、累计 history 和 answer 回填。
-- 每次包装启动使用独立会话标识；重启后不会接续旧 Bot 运行，但同 task-id 的写操作仍由原 journal 防重。正常结束、错误及 SIGTERM 取消会关闭会话；掉电、SIGKILL 等无法执行清理时由请求截止时间兜底。两端和 Bot 提示词应一起升级。
+- 每次包装启动使用独立会话标识；重启后不会接续旧 Bot 运行，但同 task-id 的写操作仍由原 journal 防重。正常结束、错误及 SIGTERM 取消会关闭会话；掉电、SIGKILL 等无法执行清理时由请求截止时间兜底。两端可通过回传端的 `update --all` 协同升级；旧 Bot 例程先安装一次稳定引导，此后工具协议随首轮完整 inbox 提供。`REQUEST_JSON.bridge_version` 与 `protocol_revision` 标识当前版本与指令摘要，`reply_commands` 由回传助手填入本机实际路径，不从运行端猜测路径。
 - 每批最多 8 个调用，顺序执行；失败后剩余调用不执行。需要上一步结果的调用分到下一轮。
 - 本任务内相同调用 ID 和相同写入内容会复用结果；同一任务重启时也读取本地记录。不同任务之间仍须先查询去重，不能承诺跨任务恰好一次。
 - 写操作超时、进程中断或响应损坏时可能已经生效。先回读状态，再决定下一步；包装不会自动重试写入或 webhook 请求。
