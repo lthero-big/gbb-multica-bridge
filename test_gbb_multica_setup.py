@@ -104,6 +104,8 @@ def check():
         (fake_bin / "config.js").write_text('''
 export function loadConfig() { return {defaultBot: 'bridge'}; }
 export function getCredentials() { return {url: 'https://example.invalid/webhook', key: 'offline'}; }
+export function homeDir() { throw new Error('MUST_NOT_ACCESS_MESSAGES'); }
+export function writeJsonAtomic() { throw new Error('MUST_NOT_WRITE_MESSAGES'); }
 ''')
         (fake_bin / "messages.js").write_text('''
 export function newMessage() { throw new Error('MUST_NOT_CREATE_MESSAGE'); }
@@ -162,7 +164,7 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             wrapper=install_dir/"gbb-multica-agent"
             assert os.access(wrapper,os.X_OK)
             version=subprocess.run([str(wrapper),"--version"],env=env,capture_output=True,text=True,check=True)
-            assert version.stdout.strip()=="gbb-multica-agent 0.4.0"
+            assert version.stdout.strip()=="gbb-multica-agent 0.5.0"
             passed(run())
             assert list(home.glob("config.json.bak-*")) == backups, "reinstall must not rewrite an updated limit"
             second=state()

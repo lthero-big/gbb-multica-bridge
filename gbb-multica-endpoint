@@ -1,33 +1,215 @@
 #!/usr/bin/env python3
-"""SSH endpoint: only check/inbox/answer for this Unix user's configured gbb."""
+"""Reply endpoint and bounded tool exchange for this user's configured gbb."""
 import argparse
+from datetime import datetime, timezone
+import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+import time
+
+
+def timing(home, event, **fields):
+    """Metadata only, one append per record; logging failures do not affect replies."""
+    try:
+        record = dict(v=1, ts=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                      event=event, pid=os.getpid(), **fields)
+        fd = os.open(str(Path(home) / 'timing.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps(record, ensure_ascii=False) + '\n').encode())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        print('GBB timing log unavailable; bridge continues', file=sys.stderr)
+
+
+def timing_context(message):
+    bridge = message.get('bridge', {})
+    if not isinstance(bridge, dict):
+        return {}
+    context = {key: value for key in ('task_id', 'request_id')
+               if isinstance((value := bridge.get(key)), str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value)}
+    if type(bridge.get('round')) is int:
+        context['round'] = bridge['round']
+    return context
+
+
+def read_message(config, message_id):
+    if not isinstance(message_id, str) or not re.fullmatch(r'm[A-Za-z0-9_-]{1,127}', message_id):
+        raise ValueError('invalid message ID')
+    message = json.loads((Path(config['gbb_home']) / 'messages' / (message_id + '.json')).read_text())
+    if not isinstance(message, dict) or message.get('id') != message_id:
+        raise ValueError('stored message ID mismatch')
+    bridge = message.get('bridge', {})
+    if not isinstance(bridge, dict):
+        raise ValueError('invalid bridge metadata')
+    if bridge.get('instance') and bridge['instance'] != config['instance_id']:
+        raise ValueError('message belongs to another instance')
+    return message
+
+
+def read_session(config, message):
+    bridge = message['bridge']
+    session_id = bridge.get('session_id')
+    if bridge.get('delivery_mode') != 'continuous' or not isinstance(session_id, str) or not re.fullmatch(r'[0-9a-f]{32}', session_id):
+        raise ValueError('message does not support continuous exchange')
+    session = json.loads((Path(config['gbb_home']) / 'sessions' / (session_id + '.json')).read_text())
+    if (not isinstance(session, dict) or session.get('session_id') != session_id or
+            session.get('instance') != config['instance_id'] or session.get('task_id') != bridge.get('task_id') or
+            session.get('status') not in ('running', 'closed')):
+        raise ValueError('session identity mismatch')
+    return session
+
+
+def wait_next(config, message_id, wait_seconds=25):
+    started = time.monotonic()
+    message = read_message(config, message_id)
+    context = timing_context(message)
+    timing(config['gbb_home'], 'exchange_wait_start', message_id=message_id, **context)
+    state = 'error'
+    try:
+        while True:
+            message = read_message(config, message_id)
+            bridge = message['bridge']
+            session = read_session(config, message)
+            if 'answer' not in message:
+                raise ValueError('submit tool calls with exchange before waiting')
+            expires = bridge.get('expires_at')
+            if not isinstance(expires, (int, float)) or not math.isfinite(expires):
+                raise ValueError('invalid request expiry')
+            if session['status'] == 'closed' or time.time() >= expires:
+                state = 'closed'
+                return {'state': state, 'message_id': message_id, 'exit_code': session.get('exit_code', 2)}
+            next_id = bridge.get('next_message_id')
+            if next_id:
+                following = read_message(config, next_id)
+                other = following.get('bridge', {})
+                if (any(other.get(key) != bridge.get(key) for key in ('instance', 'session_id', 'task_id', 'delivery_mode')) or
+                        type(bridge.get('round')) is not int or other.get('round') != bridge['round'] + 1):
+                    raise ValueError('continuation identity mismatch')
+                state = 'ready'
+                return {'state': state, 'message': following}
+            if time.monotonic() - started >= wait_seconds:
+                state = 'pending'
+                return {'state': state, 'message_id': message_id}
+            time.sleep(0.05)
+    finally:
+        timing(config['gbb_home'], 'exchange_wait_end', message_id=message_id, **context,
+               state=state, elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+
+
+def save_reply(config, message_id, text, *, failure=False, exchange=False):
+    directory = Path(config['gbb_home']) / 'messages'
+    path = directory / (message_id + '.json')
+    # A lock serializes competing helpers; atomic replacement keeps pollers from
+    # observing partial JSON. Never overwrite a different, already accepted reply.
+    with (directory / ('.' + message_id + '.reply.lock')).open('a') as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError('reply is being written; inspect inbox before retrying') from None
+                time.sleep(0.02)
+        message = read_message(config, message_id)
+        bridge = message.get('bridge', {})
+        answer = text.strip()
+        if not answer:
+            raise ValueError('empty reply')
+        if failure:
+            request_id = bridge.get('request_id', '')
+            if not isinstance(request_id, str) or not re.fullmatch(r'[0-9a-f]{32}', request_id):
+                raise ValueError('failure reply requires a matching bridge request')
+            answer = json.dumps({'gbb_tool_protocol': 1, 'request_id': request_id,
+                                 'error': answer[:4000]}, ensure_ascii=False)
+        elif bridge.get('request_id'):
+            try:
+                value = json.loads(answer)
+            except ValueError:
+                value = None  # Plain final answers remain supported.
+            if isinstance(value, dict) and 'gbb_tool_protocol' in value and value.get('request_id') != bridge['request_id']:
+                raise ValueError('reply request_id mismatch')
+        if exchange:
+            read_session(config, message)
+            value = json.loads(answer)
+            if (not isinstance(value, dict) or value.get('gbb_tool_protocol') != 1 or
+                    value.get('request_id') != bridge.get('request_id') or
+                    not isinstance(value.get('tool_calls'), list) or not 1 <= len(value['tool_calls']) <= 8 or
+                    'final' in value or 'error' in value):
+                raise ValueError('exchange requires tool-call JSON for this request')
+        if 'answer' in message:
+            if message['answer'] == answer:
+                timing(config['gbb_home'], 'reply_duplicate', message_id=message_id, **timing_context(message))
+                return  # The acknowledgment may have been lost; no second write.
+            raise ValueError('message already answered; conflicting reply rejected')
+        expires = bridge.get('expires_at')
+        if expires is not None and (not isinstance(expires, (int, float)) or
+                                    not math.isfinite(expires) or time.time() >= expires):
+            raise ValueError('request expired; reply was not written')
+        if bridge.get('delivery_mode') == 'continuous' and read_session(config, message)['status'] != 'running':
+            raise ValueError('session closed; reply was not written')
+        message.update(answer=answer, answeredAt=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+        fd, name = tempfile.mkstemp(prefix='.' + message_id + '-', dir=directory)
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(message, stream, ensure_ascii=False, indent=2)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, path)
+            timing(config['gbb_home'], 'reply_saved', message_id=message_id, **timing_context(message))
+        finally:
+            Path(name).unlink(missing_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--instance-id', required=True)
-    parser.add_argument('action', choices=('check', 'inbox', 'answer'))
+    parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail', 'exchange', 'wait'))
     parser.add_argument('message_id', nargs='?')
     parser.add_argument('stdin_marker', nargs='?', choices=('-',))
     args = parser.parse_args()
-    if args.action == 'answer' and (not args.message_id or args.stdin_marker != '-'):
-        parser.error('answer requires MESSAGE_ID - and reads the complete reply from stdin')
+    if args.action in ('answer', 'fail', 'exchange') and (not args.message_id or args.stdin_marker != '-'):
+        parser.error('answer/fail/exchange requires MESSAGE_ID - and reads the complete reply from stdin')
     if args.action == 'check' and (args.message_id or args.stdin_marker):
         parser.error('check accepts no message or input')
-    if args.action != 'answer' and args.stdin_marker:
-        parser.error('stdin is only supported by answer')
+    if args.action not in ('answer', 'fail', 'exchange') and args.stdin_marker:
+        parser.error('stdin is only supported by answer/fail/exchange')
     if args.message_id and not re.fullmatch(r'm[A-Za-z0-9_-]{1,127}', args.message_id):
         parser.error('invalid message ID')
     root = Path(os.environ.get('GBB_MULTICA_CONFIG_HOME', str(Path.home() / '.config/gbb-multica')))
     config = json.loads((root / 'server.json').read_text())
     if args.instance_id != config['instance_id']:
         parser.error('instance mismatch; refusing to access another route')
+    if args.action == 'wait':
+        if not args.message_id:
+            parser.error('wait requires MESSAGE_ID')
+        print(json.dumps(wait_next(config, args.message_id), ensure_ascii=False), flush=True)
+        return 0
+    if args.action in ('answer', 'fail', 'exchange'):
+        started = time.monotonic()
+        timing(config['gbb_home'], 'reply_start', message_id=args.message_id, action=args.action)
+        ok = False
+        try:
+            save_reply(config, args.message_id, sys.stdin.read(), failure=args.action == 'fail',
+                       exchange=args.action == 'exchange')
+            ok = True
+        finally:
+            timing(config['gbb_home'], 'reply_end', message_id=args.message_id, ok=ok,
+                   elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+        result = wait_next(config, args.message_id) if args.action == 'exchange' else {'id': args.message_id, 'accepted': True}
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0
     env = dict(os.environ, GBB_HOME=config['gbb_home'])
     # SSH's non-interactive PATH may omit the Node installation (e.g. nvm).
     env['PATH'] = str(Path(config['node_bin']).parent) + os.pathsep + env.get('PATH', '')
@@ -41,20 +223,37 @@ def main():
         result.update(instance_id=config['instance_id'], user=config['user'], gbb_home=config['gbb_home'])
         print(json.dumps(result, ensure_ascii=False))
         return 0
+    if args.action == 'inbox' and args.message_id:
+        # gbb 0.2.0 exits immediately after console.log; piped large messages
+        # can be cut off before Node flushes stdout. Read the same store here.
+        started = time.monotonic()
+        timing(config['gbb_home'], 'inbox_start', message_id=args.message_id)
+        ok, context = False, {}
+        try:
+            message = read_message(config, args.message_id)
+            context = timing_context(message)
+            print(json.dumps(message, ensure_ascii=False), flush=True)
+            ok = True
+        finally:
+            timing(config['gbb_home'], 'inbox_end', message_id=args.message_id, **context, ok=ok,
+                   elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+        return 0 if 'answer' in message else 2
     command = [config['gbb_bin'], args.action]
     if args.message_id:
         command.append(args.message_id)
     elif args.action == 'inbox':
         command += ['--limit', '10']
-    if args.action == 'answer':
-        command.append('-')
-    # Inherit stdin so multiline JSON reaches gbb without shell interpretation.
     return subprocess.run(command, env=env, timeout=30).returncode
 
 
 if __name__ == '__main__':
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+    except ValueError as exc:
+        # JSON decoder errors may include source data; only expose our fixed reasons.
+        reason = str(exc) if type(exc) is ValueError else 'invalid configuration or message JSON'
+        print('GBB reply rejected: ' + reason, file=sys.stderr)
+        raise SystemExit(1)
+    except (OSError, KeyError, subprocess.SubprocessError):
         print('GBB endpoint failed; inspect this user\'s server.json and local configuration; no retry', file=sys.stderr)
         raise SystemExit(1)

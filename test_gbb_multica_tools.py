@@ -90,7 +90,8 @@ class ToolTests(unittest.TestCase):
                     "REAL_MULTICA_FOR_HELP": REAL_CLI, "FAKE_MULTICA_STATE": str(self.state_file),
                     "MULTICA_TOKEN": "mat_OFFLINE_TASK_CREDENTIAL_123456789",
                     "MULTICA_WORKSPACE_ID": "fake-workspace", "MULTICA_TASK_ID": "offline-task",
-                    "GBB_HOME": str(self.root / "gbb"), "GBB_WAIT": "20"}
+                    "GBB_HOME": str(self.root / "gbb"), "GBB_WAIT": "20",
+                    "GBB_MULTICA_CONFIG_HOME": str(self.root / "config")}
         self.patch = patch.dict(os.environ, self.env, clear=True)
         self.patch.start()
         self.tools = Tools(time.monotonic() + 60, self.root / "gbb/multica-runs/offline-task")
@@ -205,6 +206,27 @@ class ToolTests(unittest.TestCase):
             "args": ["project", "list"], "fields": ["id", "title"]}})
         self.assertEqual(result["data"], [{"id": "p1", "title": "small"}])
 
+    def test_rerun_task_help_execution_and_write_deduplication(self):
+        help_result = self.tools.call({"id": "rerun-help", "name": "multica_help",
+                                      "arguments": {"command": ["issue", "rerun-task"]}})
+        self.assertTrue(help_result['ok'], help_result)
+        self.assertIn('--fresh', help_result['data'])
+        self.assertIn('rerun-task', self.tools.help([])['operations']['issue'])
+        self.assertEqual(self.state()['calls'], [], 'help must not rerun a task')
+        args = ['issue', 'rerun-task', 'short-run', '--issue', 'TEST-1', '--fresh']
+        first = self.call(args, call_id='rerun1')
+        self.assertTrue(first['ok'], first)
+        self.assertIn('--fresh', self.state()['calls'][0])
+        self.assertEqual(self.call(args, call_id='rerun2'), first)
+        self.tools.close()
+        self.tools = Tools(time.monotonic() + 60, self.root / 'gbb/multica-runs/offline-task')
+        self.assertEqual(self.call(args, call_id='rerun-after-restart'), first)
+        self.assertEqual(len(self.state()['calls']), 1, 'reruns are writes and must not be repeated')
+        self.assertFalse(self.call(args + ['--workspace-id', 'other'])['ok'])
+        self.tools.available = False
+        self.assertFalse(self.call(['issue', 'rerun-task', 'other-run'])['ok'])
+        self.assertEqual(len(self.state()['calls']), 1, 'no owner-login fallback for reruns')
+
     def test_create_edit_command_shapes_use_installed_cli_flags(self):
         shapes = [
             ["project", "resource", "add", "p1", "--type", "github_repo", "--url", "https://example.invalid/a.git"],
@@ -298,12 +320,146 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(len([e for e in events if e["type"] == "tool.execution_complete"]), 3)
             self.assertEqual(events[-2]["data"]["content"], "创建、编辑、回读成功")
             self.assertFalse(errors, errors)
+            timings = [json.loads(line) for line in (home / 'timing.jsonl').read_text().splitlines()]
+            starts = [r for r in timings if r['event'] == 'tool_start']
+            ends = [r for r in timings if r['event'] == 'tool_end']
+            self.assertEqual([r['call_id'] for r in starts], ['create', 'edit', 'readback'])
+            self.assertEqual([r['call_id'] for r in ends], ['create', 'edit', 'readback'])
+            for start, end in zip(starts, ends):
+                self.assertEqual(start['request_id'], end['request_id'])
+                self.assertEqual(end['task_id'], 'roundtrip-task')
+                self.assertTrue(end['ok'])
+                self.assertGreaterEqual(end['elapsed_ms'], 0)
             before = len(self.state()["calls"])
             limited = subprocess.run([sys.executable, str(ROOT / "gbb-multica-agent"), "-p", "budgetcheck"],
                 env=dict(self.env, MULTICA_TASK_ID="budget-task", GBB_MAX_ROUNDS="1"),
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(limited.returncode, 2, limited.stderr)
             self.assertEqual(len(self.state()["calls"]), before, "last-round writes must not execute without a continuation budget")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_single_webhook_dynamic_exchange_has_only_new_results(self):
+        seen, messages, errors, duplicate_results = [], [], [], []
+        bot_done = threading.Event()
+        home = Path(self.env['GBB_HOME'])
+        config = Path(self.env['GBB_MULTICA_CONFIG_HOME'])
+        config.mkdir()
+        (config / 'server.json').write_text(json.dumps({'instance_id': 'offline-instance', 'gbb_home': str(home),
+                                                      'node_bin': sys.executable}))
+        (config / 'routes.json').write_text(json.dumps({'routes': {'offline-route': {
+            'transport': 'local', 'instance_id': 'offline-instance', 'endpoint': str(ROOT / 'gbb-multica-endpoint')}}}))
+        env = dict(self.env, GBB_INSTANCE_ID='offline-instance', GBB_REPLY_ROUTE='offline-route',
+                   MULTICA_TASK_ID='continuous-task')
+        prompt = 'ORIGINAL_TASK_MUST_NOT_REPEAT'
+
+        def helper(action, mid, body=None):
+            command = [sys.executable, str(ROOT / 'gbb-multica-remote'), action, 'offline-route', mid]
+            if body is not None:
+                command.append('-')
+            result = subprocess.run(command, input=body, capture_output=True, text=True, env=env, timeout=8)
+            self.assertIn(result.returncode, (0, 2) if action == 'inbox' else (0,), result.stderr)
+            return json.loads(result.stdout)
+
+        class Webhook(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(handler):
+                payload = json.loads(handler.rfile.read(int(handler.headers['Content-Length'])))
+                seen.append(payload)
+                handler.send_response(200)
+                handler.send_header('Content-Length', '0')
+                handler.end_headers()
+                try:
+                    message = helper('inbox', payload['message_id'])
+                    initial = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
+                    if initial['remaining_requests'] == 0:
+                        closed = helper('exchange', message['id'], json.dumps({'gbb_tool_protocol': 1,
+                            'request_id': initial['request_id'], 'tool_calls': [{'id': 'over_budget',
+                            'name': 'multica', 'arguments': {'args': ['project', 'create', '--title', 'NEVER']}}]}))
+                        self.assertEqual((closed['state'], closed['exit_code']), ('closed', 2))
+                        return
+                    first_id, first_reply = None, None
+                    operations = [
+                        ('create', ['project', 'create', '--title', 'Continuous']),
+                        ('edit', None),  # Filled from the actual create result.
+                        ('readback', ['project', 'get', 'p1']),
+                        ('failed', ['unsupported', 'operation']),
+                    ]
+                    for index, (call_id, args) in enumerate(operations):
+                        messages.append(message)
+                        request = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
+                        self.assertEqual(request['delivery_mode'], 'continuous')
+                        if index:
+                            self.assertNotIn(prompt, message['question'])
+                            self.assertNotIn('user_task', request)
+                            self.assertNotIn('history', request)
+                            self.assertEqual(len(request['tool_results']), 1)
+                            self.assertEqual(request['tool_results'][0]['call_id'], operations[index - 1][0])
+                        if call_id == 'edit':
+                            args = ['project', 'update', request['tool_results'][0]['result']['data']['id'], '--title', 'Edited']
+                        reply = json.dumps({'gbb_tool_protocol': 1, 'request_id': request['request_id'],
+                            'tool_calls': [{'id': call_id, 'name': 'multica', 'arguments': {'args': args}}] +
+                            ([{'id': 'must_skip', 'name': 'multica', 'arguments': {'args': ['project', 'create', '--title', 'NEVER']}}]
+                             if call_id == 'failed' else [])})
+                        if index == 0:
+                            first_id, first_reply = message['id'], reply
+                        result = helper('exchange', message['id'], reply)
+                        self.assertEqual(result['state'], 'ready')
+                        message = result['message']
+                        if index == 0:
+                            duplicate = helper('exchange', first_id, first_reply)
+                            self.assertEqual(duplicate['message']['id'], message['id'])
+                            duplicate_results.append(duplicate)
+                    messages.append(message)
+                    final = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
+                    self.assertFalse(final['tool_results'][0]['result']['ok'])
+                    self.assertEqual(final['tool_results'][1]['unexecuted_call_ids'], ['must_skip'])
+                    helper('answer', message['id'], json.dumps({'gbb_tool_protocol': 1,
+                        'request_id': final['request_id'], 'final': 'CONTINUOUS_OK'}))
+                except BaseException as exc:
+                    errors.append(str(exc))
+                finally:
+                    bot_done.set()
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Webhook)
+        (home / 'config.json').write_text(json.dumps({'defaultBot': 'bridge'}))
+        (home / 'credentials.json').write_text(json.dumps({'bridge': {
+            'url': f'http://127.0.0.1:{server.server_port}', 'key': 'offline-only'}}))
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            result = subprocess.run([sys.executable, str(ROOT / "gbb-multica-agent"), '-p', prompt],
+                                    env=env, capture_output=True, text=True, timeout=23)
+            self.assertEqual(result.returncode, 0, (result.stderr, errors))
+            self.assertTrue(bot_done.wait(3))
+            self.assertFalse(errors, errors)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(len(messages), 5)
+            self.assertEqual(len(list((home / 'messages').glob('*.json'))), 5,
+                             'each round must create exactly one tracked inbox message')
+            self.assertEqual(len(duplicate_results), 1)
+            self.assertEqual(self.state()['projects'], [{'id': 'p1', 'title': 'Edited', 'description': None}])
+            events = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(events[-2]['data']['content'], 'CONTINUOUS_OK')
+            records = [json.loads(line) for line in (home / 'timing.jsonl').read_text().splitlines()]
+            self.assertEqual(sum(r['event'] == 'webhook_send_start' for r in records), 1)
+            self.assertEqual(sum(r['event'] == 'continuation_published' for r in records), 4)
+            self.assertEqual(sum(r['event'] == 'reply_duplicate' for r in records), 1)
+            session = json.loads(next((home / 'sessions').glob('*.json')).read_text())
+            self.assertEqual((session['status'], session['exit_code']), ('closed', 0))
+            before = self.state()['calls']
+            bot_done.clear()
+            limited = subprocess.run([sys.executable, str(ROOT / "gbb-multica-agent"), '-p', 'budgetcheck'],
+                env=dict(env, MULTICA_TASK_ID='continuous-budget', GBB_MAX_ROUNDS='1'),
+                capture_output=True, text=True, timeout=8)
+            self.assertEqual(limited.returncode, 2, limited.stderr)
+            self.assertTrue(bot_done.wait(3))
+            self.assertEqual(self.state()['calls'], before)
+            self.assertFalse(errors, errors)
         finally:
             server.shutdown()
             server.server_close()
