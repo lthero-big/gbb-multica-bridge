@@ -1,6 +1,6 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.5.5；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.6；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
 
@@ -94,6 +94,12 @@ GBB_REPLY
 ```
 
 编辑后再用 `issue get` 回读。不要用示例占位符执行实际写入。
+
+`multica_help` 的操作目录与执行白名单共用同一来源；精确操作的帮助只展示 Bridge 可用的长参数，原生 CLI 示例和全局/输出参数不直接转发。原生帮助仍由包装内部用于检测 CLI 能力。
+
+附件下载通过 `{"args":["attachment","download","附件 ID"]}` 调用，使用当前任务凭据。包装在该任务 journal 旁的私有 `downloads/` 中创建独立目录，成功后保留文件并返回 `downloaded_files`（绝对 `path`、`size_bytes`、`sha256`），不回传二进制正文。不能指定 `--output-dir`、覆盖项目文件或回退所有者凭据；失败下载会清理本次目录。此目录是缓存，不是原项目的构建产物位置；使用附件的本机工具仍受任务授权及 `read_only` 限制。缓存与任务 journal 一起保留，不因单次工具调用结束而清理。
+
+评论列表未选模式时默认 `--roots-only --summary`；显式 `--thread`、`--since`、`--roots-only` 或 `--recent` 时不追加模式。`--tail` 必须配合 `--thread`，互斥模式在调 CLI 前报出可执行的修正提示。
 
 参数不确定时使用 `multica_help`，如 `{"command":["project","update"]}`；空数组列出支持的操作。命令参数以字符串数组传递，省略 `multica`、`--output` 和全局选项。正文或附件路径只能引用 `files` 中的 `@文件名`，不能读取运行端上的既有文件。评论必须使用 `--content-file`；编辑评论还需要查询结果中的 `--expected-revision`。
 

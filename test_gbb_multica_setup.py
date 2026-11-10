@@ -164,7 +164,7 @@ export function buildPayload() { throw new Error('MUST_NOT_BUILD_PAYLOAD'); }
             wrapper=install_dir/"gbb-multica-agent"
             assert os.access(wrapper,os.X_OK)
             version=subprocess.run([str(wrapper),"--version"],env=env,capture_output=True,text=True,check=True)
-            assert version.stdout.strip()=="gbb-multica-agent 0.5.5"
+            assert version.stdout.strip()=="gbb-multica-agent 0.5.6"
             passed(run())
             assert list(home.glob("config.json.bak-*")) == backups, "reinstall must not rewrite an updated limit"
             second=state()

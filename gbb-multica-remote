@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
-VERSION = '0.5.5'
+VERSION = '0.5.6'
 
 
 def ssh_base(route):

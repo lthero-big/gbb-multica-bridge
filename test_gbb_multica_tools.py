@@ -67,6 +67,10 @@ if a[:2]==['issue','update']:
 if a[:2]==['issue','status']:
  s['issues'][0]['status']=a[3];finish(s['issues'][0])
 if a[:2]==['issue','get']: finish(s['issues'][0])
+if a[:2]==['attachment','download']:
+ Path('artifact.ipa').write_bytes(b'OFFLINE_BINARY\x00\xff')
+ if s.get('download_failure'): finish({'error':'denied'},3)
+ finish({'saved':str(Path.cwd()/'artifact.ipa')})
 if a[:3]==['issue','comment','add']:
  finish({'id':'comment1','content':Path(val('--content-file')).read_text()})
 if a[:3]==['issue','comment','list']: finish({'comments':[]})
@@ -295,6 +299,80 @@ class ToolTests(unittest.TestCase):
         self.call(["issue", "comment", "list", "i1"])
         self.assertIn("--roots-only", self.state()["calls"][-1])
         self.assertIn("--summary", self.state()["calls"][-1])
+
+    def test_help_exposes_only_bridge_operations_and_usable_flags(self):
+        group = self.tools.help(['workspace'])
+        self.assertIn('workspace get', group)
+        self.assertNotIn('workspace create', group)
+        self.assertIn('download', self.tools.help(['attachment']))
+        for command in (['issue', 'get'], ['issue', 'comment', 'add'], ['attachment', 'download']):
+            help_text = self.tools.help(command)
+            self.assertNotRegex(help_text, r'(?m)^  --(?:output(?:\s|$)|output-dir|help|content\s)')
+            self.assertNotIn('$ multica', help_text)
+        self.assertIn('--content-file', self.tools.help(['issue', 'comment', 'add']))
+        # Raw output support remains available internally for automatic JSON execution.
+        self.assertIn('--output', self.tools.cli_help(('issue', 'get')))
+        self.assertEqual(self.state()['calls'], [])
+
+    def test_comment_modes_preserve_explicit_selection_and_fail_before_cli(self):
+        for selection in (['--thread', 'comment1', '--tail', '15'], ['--recent', '3'],
+                          ['--since', '2026-11-10T00:00:00Z']):
+            result = self.call(['issue', 'comment', 'list', 'i1', *selection])
+            self.assertTrue(result['ok'], result)
+            self.assertNotIn('--roots-only', self.state()['calls'][-1])
+            self.assertNotIn('--summary', self.state()['calls'][-1])
+        before = self.state()['calls']
+        for selection in (['--tail', '15'], ['--roots-only', '--tail', '15'],
+                          ['--roots-only', '--thread', 'c1'], ['--recent', '3', '--since', 'now']):
+            self.assertFalse(self.call(['issue', 'comment', 'list', 'i1', *selection])['ok'])
+        self.assertEqual(self.state()['calls'], before)
+
+    def test_attachment_download_persists_and_replays_without_refetch(self):
+        self.tools.read_only = True
+        result = self.call(['attachment', 'download', 'attachment1'], call_id='download1')
+        self.assertTrue(result['ok'], result)
+        receipt = result['data']['downloaded_files'][0]
+        path = Path(receipt['path'])
+        self.assertTrue(path.is_relative_to(self.tools.journal.parent.resolve() / 'downloads'))
+        data = b'OFFLINE_BINARY\x00\xff'
+        self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(receipt['size_bytes'], len(data))
+        self.assertEqual(receipt['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.tools.close()
+        self.tools = Tools(time.monotonic() + 60, self.root / 'gbb/multica-runs/offline-task')
+        self.assertEqual(self.call(['attachment', 'download', 'attachment1'], call_id='download1'), result)
+        self.assertEqual(len(self.state()['calls']), 1)
+        self.assertEqual(path.read_bytes(), data)
+        for args in (['attachment', 'download', '../escape'],
+                     ['attachment', 'download', 'attachment1', '--output-dir', '/tmp'],
+                     ['attachment', 'download', 'attachment1', 'extra']):
+            self.assertFalse(self.call(args)['ok'])
+        self.assertEqual(len(self.state()['calls']), 1)
+
+    def test_failed_or_unsafe_download_is_cleaned_and_never_claims_success(self):
+        self.tools.cli_help(('attachment', 'download'))
+        outside = self.root / 'untouched'
+        outside.write_text('KEEP')
+        outside.chmod(0o644)
+        for mode in ('failed', 'empty', 'symlink', 'hardlink', 'directory', 'timeout'):
+            def download(args, *, cwd):
+                if mode == 'symlink': (cwd / 'bad').symlink_to(outside)
+                if mode == 'hardlink': os.link(outside, cwd / 'bad')
+                if mode == 'directory': (cwd / 'bad').mkdir()
+                if mode in ('failed', 'timeout'): (cwd / 'partial').write_text('partial')
+                if mode == 'timeout': raise subprocess.TimeoutExpired('fake', 1)
+                return (3 if mode == 'failed' else 0), '', 'denied'
+            with self.subTest(mode=mode), patch.object(self.tools, 'cli', side_effect=download):
+                self.assertFalse(self.call(['attachment', 'download', 'attachment1'])['ok'])
+                self.assertEqual(list((self.tools.journal.parent / 'downloads').iterdir()), [])
+                self.assertEqual(outside.read_text(), 'KEEP')
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
+        cache = self.tools.journal.parent / 'downloads'
+        cache.rmdir()
+        cache.symlink_to(self.root, target_is_directory=True)
+        self.assertFalse(self.call(['attachment', 'download', 'attachment1'])['ok'])
 
     def test_bad_write_response_and_timeout_are_not_retried(self):
         args = ["project", "create", "--title", "Broken JSON after commit"]
