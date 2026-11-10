@@ -20,7 +20,18 @@ def check():
     prompt = '运行时连通性测试\n' + ('长任务 "quotes" $HOME `literal`\n' * 2000)
     with tempfile.TemporaryDirectory(prefix="gbb-offline-") as tmp:
         env = dict(os.environ, GBB_HOME=tmp, GBB_TARGET_BOT="bridge",
-                   GBB_INSTANCE_ID="linux-alice", GBB_REPLY_ROUTE="alice", GBB_MULTICA_CONFIG_HOME=tmp)
+                   GBB_INSTANCE_ID="linux-alice", GBB_REPLY_ROUTE="alice", GBB_MULTICA_CONFIG_HOME=tmp,
+                   GBB_NO_KEYCHAIN="1")
+        task_dir = Path(tmp, 'task').resolve()
+        task_dir.mkdir()
+        instructions = 'Multica task instructions\n' + '完整上下文\n' * 6000 + 'END_CONTEXT'
+        (task_dir / 'AGENTS.md').write_text(instructions)
+        resources_dir = task_dir / '.multica/project'
+        resources_dir.mkdir(parents=True)
+        (resources_dir / 'resources.json').write_text(json.dumps({
+            'project_id': 'p1', 'project_title': 'offline project', 'resources': [{
+                'resource_type': 'local_directory', 'resource_ref': {
+                    'local_path': '/original/project', 'execution_mode': 'worktree'}}]}))
         Path(tmp, 'server.json').write_text(json.dumps({
             'instance_id': 'linux-alice', 'gbb_home': tmp, 'node_bin': sys.executable,
         }))
@@ -80,14 +91,14 @@ def check():
             def run(*args, **changes):
                 return subprocess.run(
                     [sys.executable, wrapper, *args], env=dict(env, **changes),
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, timeout=10, cwd=task_dir,
                 )
 
             def events(result):
                 return [json.loads(line) for line in result.stdout.splitlines()]
 
             version = run("--version")
-            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.4"
+            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.7"
             assert not seen, "version must never send a request"
 
             config_before = Path(tmp, "config.json").read_bytes()
@@ -104,6 +115,11 @@ def check():
             assert budget and 3500 <= int(budget.group(1)) <= 3600, "unset GBB_WAIT must provide a one-hour budget"
             request = json.loads(seen[0]["summary"].split("REQUEST_JSON:\n", 1)[1])
             assert request["user_task"] == prompt, "complete task must survive gbb's default truncation limit"
+            assert request['interaction_mode'] == 'non_interactive'
+            assert request['runtime_instructions']['content'] == instructions
+            assert request['execution_context']['working_directory'] == str(task_dir)
+            assert request['execution_context']['project']['local_path'] == '/original/project'
+            assert request['execution_context']['target_local_device_name']
             assert seen[0]['bridge_instance'] == 'linux-alice' and seen[0]['reply_route'] == 'alice'
             assert f'gbb-multica-remote answer alice {seen[0]["message_id"]} -' in seen[0]['next'][0]
             assert request['reply_route'] == 'alice'
@@ -218,6 +234,7 @@ def check():
             process = subprocess.Popen(
                 [sys.executable, wrapper, "-p", "cancellation test"],
                 env=dict(env, GBB_WAIT="900"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=task_dir,
             )
             try:
                 assert received.wait(5), "request did not reach local webhook"

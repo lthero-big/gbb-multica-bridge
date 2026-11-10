@@ -1,8 +1,10 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.5.4；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.7；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
+
+Multica 调用是无人值守的后台任务。0.5.7 起每轮 `REQUEST_JSON` 明确带 `interaction_mode=non_interactive`。Bot 不应在 Grok 聊天中弹出提问/选项并等待点击；格式选择、生成正文文件和已确认未执行的参数错误应在现有授权范围内自行处理。确实需要用户决策或缺少输入时，立即通过当前 `answer` 回传 `final`，写明阻塞原因及精确问题/选项，不能把澄清说成任务已完成；该运行结束，用户在 Multica 回答后启动新任务。真正的权限或连接阻塞用当前 `fail` 回传具体要求，不绕过权限，不以沉默代替同意。现有超时仍是兜底；Bridge 看不到 Grok 原生提问卡片，无法强制拦截，指令更新不能证明模型永不偏离。
 
 安装后新开对应实例 Agent 的聊天，发送例如：
 
@@ -36,7 +38,17 @@
 
 共映射 109 个当前 CLI 子命令；这是支持的命令数，不代表每个当前任务均有写权限。属性定义等操作仍受平台角色限制。
 
-不提供任意 shell、读取主机文件、登录切换、daemon 控制、跨工作区操作或明文凭证管理。模型选择和会话恢复仍不支持；Agent 的模型、自定义启动参数、思考档位和服务档位应留空。
+Bridge 的 Multica 工具不提供任意 shell、读取主机文件、登录切换、daemon 控制、跨工作区操作或明文凭证管理。此边界不代表整个任务禁止使用已获授权的 Grok 原生本机工具。模型选择和会话恢复仍不支持；Agent 的模型、自定义启动参数、思考档位和服务档位应留空。
+
+## 首轮执行环境与任务指令
+
+0.5.5 起，完整 inbox 的首轮 `REQUEST_JSON` 包含 `execution_context`：运行端系统主机名、目标本机设备名、操作系统、包装的实际 `working_directory`，以及当前目录 `.multica/project/resources.json` 中的项目和资源信息。单个本地目录资源另提供 `project.local_path` 和 `execution_mode`；多个资源保留列表，不猜测当前使用哪一个。资源指针和 `worktree` 配置都不是实际检出、构建成功或产物存在的证据。
+
+目标设备名默认采用运行端 `socket.gethostname()`，不会查询 Grok 的设备注册表；若 Grok 显示名不同，可在对应 Agent 的自定义环境中设置 `GBB_LOCAL_DEVICE_NAME`。它只是设备选择提示，不是 Grok machine ID、连接状态或权限凭据，`local_execution_status=unverified` 明确保留这一限制。跨机 SSH 回填路由也不会因此授予 Grok 对运行端的原生访问权。Bot 须通过原生工具核对实际设备和目录；连接或权限失败时报告具体错误，不换成云端同名路径，也不修改项目绑定。`read_only=true` 的恢复模式仍禁止原生任务工具。首轮上下文（`AGENTS.md` 与项目资源）单文件上限 128 KiB、合计 160 KiB，超限时该项标记为 `unavailable`，不转发部分内容；`resource_ref` 仅转发 `local_path`/`execution_mode`/`url`/`ref`/`branch`/`name`，并对 GitHub/AWS/Slack 令牌、Bearer 与 URL 用户信息脱敏。
+
+`runtime_instructions` 携带当前任务目录 `AGENTS.md` 全文；该文件缺失时兼容读取 `.github/copilot-instructions.md`。只读取当前目录的固定入口，不向父目录搜索，不读取资源路径指向的业务文件，不展开技能目录。文本及资源信息经过既有凭据脱敏，再随首轮发送。任务指令不能覆盖 Bridge 协议或扩大授权。
+
+各文件提供 `source` 和 `status`，缺失为 `missing`，无权限、非 UTF-8、非普通文件、符号链接逃逸或超过单文件 1 MiB 时为 `unavailable`，并标明缺口，不发送截断内容。后续连续交换只传新增工具结果；兼容模式的新 Webhook 和明确只读恢复的新 Bot 运行重新带上同一启动快照，不重复读取变化中的文件。`cwd` 仍保留在 Webhook 外层，但 Bot 应以完整 inbox 为依据。
 
 ## 手动回填协议
 
@@ -84,6 +96,12 @@ GBB_REPLY
 ```
 
 编辑后再用 `issue get` 回读。不要用示例占位符执行实际写入。
+
+`multica_help` 的操作目录与执行白名单共用同一来源；精确操作的帮助只展示 Bridge 可用的长参数，原生 CLI 示例和全局/输出参数不直接转发。原生帮助仍由包装内部用于检测 CLI 能力。
+
+附件下载通过 `{"args":["attachment","download","附件 ID"]}` 调用，使用当前任务凭据。包装在该任务 journal 旁的私有 `downloads/` 中创建独立目录，成功后保留文件并返回 `downloaded_files`（绝对 `path`、`size_bytes`、`sha256`），不回传二进制正文。不能指定 `--output-dir`、覆盖项目文件或回退所有者凭据；失败下载会清理本次目录。此目录是缓存，不是原项目的构建产物位置；使用附件的本机工具仍受任务授权及 `read_only` 限制。`read_only` 只禁止修改 Multica 状态，下载只写本地私有缓存，因此在只读恢复下仍允许（用于读取任务输入）。单次下载上限 512 MiB，每个任务缓存上限 2 GiB，超限时终止下载并清理；超过 7 天的附件副本在下次下载前清理。缓存与任务 journal 一起保留，不因单次工具调用结束而清理。
+
+评论列表未选模式时默认 `--roots-only --summary`；显式 `--thread`、`--since`、`--roots-only` 或 `--recent` 时不追加模式。`--tail` 必须配合 `--thread`，互斥模式在调 CLI 前报出可执行的修正提示。
 
 参数不确定时使用 `multica_help`，如 `{"command":["project","update"]}`；空数组列出支持的操作。命令参数以字符串数组传递，省略 `multica`、`--output` 和全局选项。正文或附件路径只能引用 `files` 中的 `@文件名`，不能读取运行端上的既有文件。评论必须使用 `--content-file`；编辑评论还需要查询结果中的 `--expected-revision`。
 

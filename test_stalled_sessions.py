@@ -198,7 +198,11 @@ class StalledSessions(unittest.TestCase):
         process.kill()
         # Node inherited the stdout/stderr pipes: EOF proves the orphan waiter exited.
         process.communicate(timeout=5)
-        self.assertEqual(json.loads((self.home / 'sessions' / (sid + '.json')).read_text())['status'], 'closed')
+        # The independent guardian may persist closure just after Node closes its pipes.
+        path = self.home / 'sessions' / (sid + '.json')
+        eventually(lambda: json.loads(path.read_text())['status'] == 'closed')
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            self.reply(mid, final='LATE')
 
     def test_missing_owner_lease_rejects_immediately_even_before_guardian(self):
         session = AGENT['Session'](self.home, 'test-task', 'test')
