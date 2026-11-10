@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
-VERSION = '0.5.3'
+VERSION = '0.5.4'
 
 
 def ssh_base(route):
@@ -32,15 +32,15 @@ def endpoint_args(route, action, message_id=None):
     endpoint = route.get('endpoint', '')
     if not isinstance(endpoint, str) or not endpoint.startswith('/') or any(c in endpoint for c in '\n\r\0'):
         raise ValueError('endpoint must be an absolute path')
-    if action not in ('check', 'inbox', 'answer', 'fail', 'exchange', 'wait'):
+    if action not in ('check', 'inbox', 'answer', 'fail', 'exchange', 'wait', 'progress'):
         raise ValueError('unsupported action')
     if message_id is not None and not re.fullmatch(r'm[A-Za-z0-9_-]{1,127}', message_id):
         raise ValueError('invalid message ID')
     remote = [endpoint, '--instance-id', route['instance_id'], action]
     if message_id:
         remote.append(message_id)
-    if action == 'wait' and not message_id:
-        raise ValueError('wait requires message ID')
+    if action in ('wait', 'progress') and not message_id:
+        raise ValueError('wait/progress requires message ID')
     if action in ('answer', 'fail', 'exchange'):
         if not message_id:
             raise ValueError('answer/fail/exchange requires message ID')
@@ -70,13 +70,13 @@ def decorate(result, route_name):
         prefix = [str(Path(__file__).resolve())]
         message['reply_commands'] = {action: [*prefix, action, route_name, message['id'],
                                    *(['-'] if action in ('answer', 'fail', 'exchange') else [])]
-                                   for action in ('answer', 'fail', 'exchange', 'wait')}
+                                   for action in ('answer', 'fail', 'exchange', 'wait', 'progress')}
     return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail', 'exchange', 'wait'))
+    parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail', 'exchange', 'wait', 'progress'))
     parser.add_argument('route')
     parser.add_argument('message_id', nargs='?')
     parser.add_argument('stdin_marker', nargs='?', choices=('-',))

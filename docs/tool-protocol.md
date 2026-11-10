@@ -1,6 +1,6 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.5.3；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.4；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
 
@@ -112,12 +112,26 @@ Issue 任务的新包装进程会在第一次请求的 `REQUEST_JSON.prior_conte
 - 回填助手原子保存回复，拒绝过期请求、其他实例、错误 request_id 和已有不同回复。同一回复重复提交只确认，不覆盖第一次结果；新回复不再通过会提前退出的 gbb CLI 输出管道保存。已有旧消息没有截止时间元数据时保持兼容。
 - 包装监听消息目录变化，回复原子落盘后即可唤醒；文件监听不可用、报错或漏通知时仍由 1 秒轮询兜底。转发耗时与 Bot 思考及工具执行耗时分别计算。
 - `GBB_WAIT` 默认 3600 秒（1 小时），包含整个多轮流程，而非每轮分别等待 1 小时。
-- `GBB_MAX_ROUNDS` 默认 8，允许 1–32；连续模式整次任务只有一次 Webhook，后续轮次是本机/SSH 工具结果交换。达到最后一轮时仅允许最终回答，不执行新的工具批次。无路由兼容模式仍使用逐轮 Webhook、累计 history 和 answer 回填。
-- 每次包装启动使用独立会话标识；重启后不会接续旧 Bot 运行，但同 task-id 的写操作仍由原 journal 防重。正常结束、错误及 SIGTERM 取消会关闭会话；掉电、SIGKILL 等无法执行清理时由请求截止时间兜底。两端可通过回传端的 `update --all` 协同升级；旧 Bot 例程先安装一次稳定引导，此后工具协议随首轮完整 inbox 提供。`REQUEST_JSON.bridge_version` 与 `protocol_revision` 标识当前版本与指令摘要，`reply_commands` 由回传助手填入本机实际路径，不从运行端猜测路径。
+- `GBB_MAX_ROUNDS` 默认 8，允许 1–32；连续模式正常任务只有一次 Webhook，后续轮次是本机/SSH 工具结果交换。达到最后一轮时仅允许最终回答，不执行新的工具批次。无路由兼容模式仍使用逐轮 Webhook、累计 history 和 answer 回填。
+- 每次包装启动使用独立会话标识；重启后不会接续旧 Bot 运行，但同 task-id 的写操作仍由原 journal 防重。正常结束、错误及 SIGTERM 取消会关闭会话；SIGKILL 或整个进程组被强杀时，独立会话守护进程通过唯一文件锁发现所有者退出并关闭会话；endpoint 即使在守护进程落盘前也拒绝无锁所有者的旧请求。掉电/系统未调度时无法承诺清理时延，恢复后仍会拒绝已失去所有者的会话。两端可通过回传端的 `update --all` 协同升级；旧 Bot 例程先安装一次稳定引导，此后工具协议随首轮完整 inbox 提供。`REQUEST_JSON.bridge_version` 与 `protocol_revision` 标识当前版本与指令摘要，`reply_commands` 由回传助手填入本机实际路径，不从运行端猜测路径。
 - 每批最多 8 个调用，顺序执行；失败后剩余调用不执行。需要上一步结果的调用分到下一轮。
 - 本任务内相同调用 ID 和相同写入内容会复用结果；同一任务重启时也读取本地记录。不同任务之间仍须先查询去重，不能承诺跨任务恰好一次。
-- 写操作超时、进程中断或响应损坏时可能已经生效。先回读状态，再决定下一步；包装不会自动重试写入或 webhook 请求。
+- 写操作超时、进程中断或响应损坏时可能已经生效。先回读状态，再决定下一步；包装不会自动重试写入或不确定是否送达的 webhook 请求。
 - 本地记录位于 gbb 数据目录的 `multica-runs/<task-id>/journal.jsonl`，权限 0600，用于检查已完成或未确认的操作。记录和发送给 Grok 的结果会遮盖任务 token、已知 webhook 凭证及敏感配置字段。
+
+### 无进展检测和恢复
+
+连续模式在 Webhook 成功返回或下一轮结果发布后开始计时，只计算等待 Bot 的时间，不将本地 Multica 工具运行时间算作无进展。`GBB_IDLE_WARN=300` 时向 Multica 输出等待提示，`GBB_IDLE_TIMEOUT=600` 时结束等待并关闭会话（退出码 3）。两个值均为秒，要求 `0 < GBB_IDLE_WARN < GBB_IDLE_TIMEOUT`。更短的 `GBB_WAIT` 总预算优先，退出码 2。无回填不等于模型一直在思考，也不能证明云端任务已停止。
+
+长任务在真实步骤完成后、尚未回填的当前消息上执行：
+
+```sh
+gbb-multica-remote progress ROUTE MESSAGE_ID
+```
+
+进展序号原子更新并与回复共用写锁；不接受过期、已回答或已关闭的消息。它只重置无进展计时，不延长 `GBB_WAIT`。`inbox` 读取、`wait` 轮询、HTTP 成功和无人值守心跳不能证明任务进展，均不自动续期。长时间不可分割的原生调用需在任务开始前调大无进展上限，或使用能查询真实进度的后台任务。超时/取消撤销 Bridge 会话并停止接收后续工具调用，不能强行终止 Grok 云端推理或已经启动的本机原生操作。
+
+默认不自动重发。只有调用方明确保证整个任务只读、且授权恢复时，才可设置 `GBB_RETRY_READ_ONLY=1`。该模式在执行 CLI 前拒绝 Multica 写命令，指令限定 Bot 只使用 Bridge 工具和回填助手；它不能从技术上撤销 Grok 原生工具权限，不能用于“可能写入”的任务。仅无进展超时、没有任何写入 journal、尚未重试且剩余总预算大于无进展上限时，先关闭旧会话，再触发一次新会话。恢复首轮提供原任务及本次已完成的结果；正常后续轮仍只发送新增结果。轮数和总预算不重置。发送失败、明确处理失败、总超时、取消和结果不确定的写入均不自动重试；先回读本机/平台状态，再由用户决定。
 
 ## 节点计时日志
 
@@ -134,10 +148,15 @@ Issue 任务的新包装进程会在第一次请求的 `REQUEST_JSON.prior_conte
 | `reply_duplicate` | 相同回复重复回填，被幂等确认 |
 | `answer_received` | 等待进程观察到回复；含 HTTP 返回后的等待耗时 |
 | `tool_start` / `tool_end` | 包装本地执行一项 Multica 工具；含 `ok` 与执行耗时 |
+| `task_budget_expired` | 整个任务绝对预算耗尽，由包装终止等待进程 |
 | `answer_timeout` / `transport_error` | 等待超时或传输异常；异常只记录阶段及安全错误码 |
 | `continuation_published` | 新增结果已落盘并链接到上一轮；附 `previous_message_id`，不发送 Webhook |
 | `exchange_wait_start` / `exchange_wait_end` | 回填助手等待下一批结果；结束含 `state` 和等待耗时 |
-| `session_closed` | 包装关闭本次会话；含任务退出码 |
+| `session_closed` | 包装或独立守护进程关闭本次会话；含任务退出码、会话和关闭原因 |
+| `bot_wait_start` | HTTP 确认/结果发布后，包装开始监测等待 |
+| `bot_idle_warning` / `bot_idle_timeout` | 无进展提示/截止；含 `idle_ms` |
+| `bot_progress` / `bot_progress_observed` | endpoint 接受真实进展、包装观察到序号更新 |
+| `read_only_retry` | 显式只读恢复，`attempt=1` |
 
 用 `webhook_send_end → inbox_start` 查看触发确认到读取命令开始的间隔，`inbox_end → reply_start` 查看 Bot 处理区间，`reply_saved → answer_received` 查看本地回填唤醒延迟。多次读取可按同一 `message_id` 分别检查。`webhook_send_end` 仅表示 HTTP 确认，不能证明 Bot 已开始执行；Bot 也可能在 HTTP 返回前读取消息。
 连续模式后续轮次可用 `tool_end → continuation_published → exchange_wait_end(state=ready)` 分别查看结果发布与助手交付耗时，再用下一轮的 `reply_start` 查看 Bot 继续处理的区间。`exchange_wait_end` 是运行端输出完成，不代表云端已接收到输出。
