@@ -103,13 +103,13 @@ locate_repo() {
   here=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
   if [[ -z $REPO_DIR && -n $here && -f $here/../install.sh && -f $here/../gbb-multica-remote ]]; then
     REPO_DIR=$(cd "$here/.." && pwd)
-    log "使用脚本所在仓库：$REPO_DIR（不自动更新；需要时先 git pull）"
+    log "使用脚本所在仓库：${REPO_DIR}（不自动更新；需要时先 git pull）"
     return
   fi
   REPO_DIR=${REPO_DIR:-$HOME/.local/share/gbb-multica-bridge/repo}
   command -v git >/dev/null || die "需要 git 来获取仓库"
   if [[ -d $REPO_DIR/.git ]]; then
-    log "更新仓库：$REPO_DIR（$REF）"
+    log "更新仓库：${REPO_DIR}（${REF}）"
     act git -C "$REPO_DIR" fetch --quiet origin "$REF"
     act git -C "$REPO_DIR" checkout --quiet "$REF"
     act git -C "$REPO_DIR" merge --quiet --ff-only "origin/$REF"
@@ -132,14 +132,14 @@ ensure_host_key() {
   fi
   if [[ -z $HOST_KEY_SHA256 ]]; then
     [[ $MODE == dry-run || -t 0 ]] && { log "known_hosts 没有该主机；稍后由 SSH 交互确认指纹"; return; }
-    die "known_hosts 没有 $name。请在运行端执行 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 取得指纹，用 --host-key-sha256 传入后重跑"
+    die "known_hosts 没有 ${name}。请在运行端执行 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 取得指纹，用 --host-key-sha256 传入后重跑"
   fi
   log "known_hosts 没有该主机，按 --host-key-sha256 核对后写入"
   [[ $MODE == dry-run ]] && { show ssh-keyscan -t ed25519 -p "$PORT" "$HOST"; return; }
   scanned=$(ssh-keyscan -T 10 -t ed25519 -p "$PORT" "$HOST" 2>/dev/null) || true
   [[ -n $scanned ]] || die "ssh-keyscan 取不到 $HOST 的 ED25519 主机密钥"
   fp=$(ssh-keygen -lf - <<<"$scanned" | awk '{print $2}')
-  [[ $fp == "$HOST_KEY_SHA256" ]] || die "主机指纹不符：期望 $HOST_KEY_SHA256，实际 $fp。未写入 known_hosts"
+  [[ $fp == "$HOST_KEY_SHA256" ]] || die "主机指纹不符：期望 ${HOST_KEY_SHA256}，实际 ${fp}。未写入 known_hosts"
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
   (umask 077; printf '%s\n' "$scanned" >>"$known")
 }
@@ -178,7 +178,7 @@ ensure_ssh() {
   fi
   if [[ $MODE != dry-run && ! -t 0 ]]; then
     if [[ ! -e $KEY ]]; then
-      log "生成私钥 $KEY（Ed25519，无口令，仅存本机）"
+      log "生成私钥 ${KEY}（Ed25519，无口令，仅存本机）"
       mkdir -p "$(dirname -- "$KEY")"
       ssh-keygen -q -t ed25519 -N '' -f "$KEY" -C "gbb-multica:$ALIAS" </dev/null
     fi
@@ -193,7 +193,7 @@ run_checks() {
   local helper="$HOME/.local/bin/gbb-multica-remote"
   log "检查回填链路（只读，不发送 Grok 请求）"
   install_sh reply --route "$ROUTE" --check
-  [[ $MODE == dry-run || -x $helper ]] || die "缺少回填助手 $helper；去掉 --check 重跑以安装"
+  [[ $MODE == dry-run || -x $helper ]] || die "缺少回填助手 ${helper}；去掉 --check 重跑以安装"
   act "$helper" check "$ROUTE"
 }
 
@@ -206,7 +206,7 @@ main() {
   if [[ $MODE != check ]]; then
     ensure_host_key
     ensure_ssh
-    log "安装回填助手并写入路由 $ROUTE（复用已有配置）"
+    log "安装回填助手并写入路由 ${ROUTE}（复用已有配置）"
     local args=(--route "$ROUTE" --transport ssh --ssh-alias "$ALIAS")
     [[ -n $INSTANCE ]] && args+=(--instance-id "$INSTANCE")
     [[ -n $BOT ]] && args+=(--bot "$BOT")
@@ -217,10 +217,10 @@ main() {
   [[ $MODE == dry-run ]] && { log "dry-run 结束；SSH 已可用时实际运行会跳过 install.sh ssh"; return; }
   cat <<DONE
 
-回传端已就绪：路由 $ROUTE → $ALIAS，助手 $HOME/.local/bin/gbb-multica-remote。
+回传端已就绪：路由 $ROUTE → ${ALIAS}，助手 $HOME/.local/bin/gbb-multica-remote。
 下一步：
   1. 确认 Grok Bot 的「Multica bridge」例程说明里的助手路径仍是 $HOME/.local/bin/gbb-multica-remote、
-     路由仍是 $ROUTE（完整提示词：\${GBB_MULTICA_CONFIG_HOME:-~/.config/gbb-multica}/grok-bot-prompt.md）。
+     路由仍是 ${ROUTE}（完整提示词：\${GBB_MULTICA_CONFIG_HOME:-~/.config/gbb-multica}/grok-bot-prompt.md）。
      webhook URL/key 和运行端没有改动，无需重配。
   2. 在 Multica 新聊天发送“请只回复 GBB_RUNTIME_OK”，收到回答即整条链路恢复。
 DONE

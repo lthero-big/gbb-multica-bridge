@@ -22,7 +22,7 @@ gbb-multica 回传端一键恢复（在被清空的 Grok Bot 电脑上执行，�
   bash $0 authorize 'ssh-ed25519 AAAA... gbb-multica:ALIAS'
 
 其他子命令：
-  bash $0 update   # 快进更新 $REPO_DIR（不重装运行端）
+  bash $0 update   # 快进更新 ${REPO_DIR}（不重装运行端）
   bash $0 print    # 输出恢复脚本内容
 USAGE
 }
@@ -36,7 +36,7 @@ authorize() {
     echo "公钥已在 $file 中，无需重复添加"
   else
     printf '\n%s\n' "$key" >>"$file"
-    echo "已追加到 $file：$(ssh-keygen -lf - <<<"$key")"
+    echo "已追加到 ${file}：$(ssh-keygen -lf - <<<"$key")"
   fi
 }
 

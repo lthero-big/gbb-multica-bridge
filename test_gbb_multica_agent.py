@@ -87,7 +87,7 @@ def check():
                 return [json.loads(line) for line in result.stdout.splitlines()]
 
             version = run("--version")
-            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.3"
+            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.4"
             assert not seen, "version must never send a request"
 
             config_before = Path(tmp, "config.json").read_bytes()
@@ -211,7 +211,7 @@ def check():
             timeout = run("-p", "timeout test", GBB_WAIT="1")
             assert timeout.returncode == 2 and events(timeout)[-1]["exitCode"] == 2
             records = [json.loads(line) for line in timing_path.read_text().splitlines()]
-            assert any(r['event'] == 'answer_timeout' and r['task_id'] == records[-1]['task_id'] for r in records)
+            assert any(r['event'] in ('answer_timeout', 'task_budget_expired') and r['task_id'] == records[-1]['task_id'] for r in records)
             assert records[-1]['event'] == 'task_end' and records[-1]['exit_code'] == 2
 
             received.clear()

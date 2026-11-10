@@ -21,7 +21,7 @@ import time
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '0.5.3'
+VERSION = '0.5.4'
 UPSTREAM_URLS = ('https://github.com/lthero-big/gbb-multica-bridge.git',
                  'https://github.com/lthero-big/gbb-multica-bridge',
                  'git@github.com:lthero-big/gbb-multica-bridge.git',

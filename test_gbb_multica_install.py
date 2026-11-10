@@ -59,7 +59,7 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
         cls.state.write_text(json.dumps({'daemon_pid': os.getpid(), 'calls': [], 'writes': [], 'profiles': [], 'agents': [], 'env': {}}))
         # Deliberately exclude every inherited Multica token and webhook override.
         cls.env = {'HOME': str(cls.alice), 'PATH': str(cls.fake) + os.pathsep + os.environ['PATH'],
-                   'LANG': 'C.UTF-8', 'FAKE_MULTICA_STATE': str(cls.state)}
+                   'LANG': 'C.UTF-8', 'GBB_NO_KEYCHAIN': '1', 'FAKE_MULTICA_STATE': str(cls.state)}
         cls.command = ['bash', str(ROOT / 'install.sh'), 'server', '--instance-id', 'alice',
                        '--bot', 'bridge-alice', '--profile', 'alice-login']
         first = subprocess.run(cls.command, env=cls.env, capture_output=True, text=True, timeout=90)
@@ -525,7 +525,8 @@ sys.exit(subprocess.run(shlex.split(command),env=env).returncode)
             self.assertIn('key', displayed)
             self.assertIn('还会显示填好路径和路由的运行提示词', displayed)
             return 'https://example.invalid/webhook'
-        with patch.object(INSTALL['sys'].stdin, 'isatty', return_value=True), \
+        with patch.dict(os.environ, GBB_NO_KEYCHAIN='1'), \
+                patch.object(INSTALL['sys'].stdin, 'isatty', return_value=True), \
                 patch('builtins.input', side_effect=input_url), \
                 patch.object(INSTALL['getpass'], 'getpass', return_value='FRESH_OFFLINE_KEY'), \
                 redirect_stdout(output):

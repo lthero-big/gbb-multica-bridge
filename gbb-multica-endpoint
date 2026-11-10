@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reply endpoint and bounded tool exchange for this user's configured gbb."""
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -64,6 +65,18 @@ def read_session(config, message):
             session.get('instance') != config['instance_id'] or session.get('task_id') != bridge.get('task_id') or
             session.get('status') not in ('running', 'closed')):
         raise ValueError('session identity mismatch')
+    if session['status'] == 'running' and session.get('owner_lease'):
+        # A killed wrapper releases this unique lock, even before its guardian runs.
+        # Refuse immediately; PID checks alone could accept a reused process ID.
+        try:
+            with (Path(config['gbb_home']) / 'sessions' / (session_id + '.lock')).open('r') as lease:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return session
+        except FileNotFoundError:
+            pass
+        return {**session, 'status': 'closed', 'exit_code': 130, 'reason': 'owner_exit'}
     return session
 
 
@@ -104,11 +117,10 @@ def wait_next(config, message_id, wait_seconds=25):
                state=state, elapsed_ms=round((time.monotonic() - started) * 1000, 3))
 
 
-def save_reply(config, message_id, text, *, failure=False, exchange=False):
+@contextmanager
+def reply_lock(config, message_id):
+    read_message(config, message_id)  # Validate before constructing a lock path.
     directory = Path(config['gbb_home']) / 'messages'
-    path = directory / (message_id + '.json')
-    # A lock serializes competing helpers; atomic replacement keeps pollers from
-    # observing partial JSON. Never overwrite a different, already accepted reply.
     with (directory / ('.' + message_id + '.reply.lock')).open('a') as lock:
         os.fchmod(lock.fileno(), 0o600)
         deadline = time.monotonic() + 2
@@ -120,6 +132,49 @@ def save_reply(config, message_id, text, *, failure=False, exchange=False):
                 if time.monotonic() >= deadline:
                     raise ValueError('reply is being written; inspect inbox before retrying') from None
                 time.sleep(0.02)
+        yield
+
+
+def write_message(config, message_id, message):
+    directory = Path(config['gbb_home']) / 'messages'
+    fd, name = tempfile.mkstemp(prefix='.' + message_id + '-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(message, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, directory / (message_id + '.json'))
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def progress(config, message_id):
+    with reply_lock(config, message_id):
+        message = read_message(config, message_id)
+        bridge = message['bridge']
+        expires = bridge.get('expires_at')
+        if (isinstance(expires, bool) or not isinstance(expires, (int, float)) or
+                not math.isfinite(expires) or time.time() >= expires):
+            raise ValueError('request expired; progress was not written')
+        if read_session(config, message)['status'] != 'running' or 'answer' in message:
+            raise ValueError('request closed or already answered; progress was not written')
+        sequence = bridge.get('progress_seq', 0)
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError('invalid progress sequence')
+        bridge.update(progress_seq=sequence + 1,
+                      progress_at=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+        write_message(config, message_id, message)
+        timing(config['gbb_home'], 'bot_progress', message_id=message_id,
+               progress_seq=sequence + 1, **timing_context(message))
+    return {'id': message_id, 'accepted': True, 'progress_seq': sequence + 1}
+
+
+def save_reply(config, message_id, text, *, failure=False, exchange=False):
+    # A lock serializes competing helpers; atomic replacement keeps pollers from
+    # observing partial JSON. Never overwrite a different, already accepted reply.
+    with reply_lock(config, message_id):
         message = read_message(config, message_id)
         bridge = message.get('bridge', {})
         answer = text.strip()
@@ -158,24 +213,14 @@ def save_reply(config, message_id, text, *, failure=False, exchange=False):
         if bridge.get('delivery_mode') == 'continuous' and read_session(config, message)['status'] != 'running':
             raise ValueError('session closed; reply was not written')
         message.update(answer=answer, answeredAt=datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
-        fd, name = tempfile.mkstemp(prefix='.' + message_id + '-', dir=directory)
-        try:
-            with os.fdopen(fd, 'w') as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                json.dump(message, stream, ensure_ascii=False, indent=2)
-                stream.write('\n')
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(name, path)
-            timing(config['gbb_home'], 'reply_saved', message_id=message_id, **timing_context(message))
-        finally:
-            Path(name).unlink(missing_ok=True)
+        write_message(config, message_id, message)
+        timing(config['gbb_home'], 'reply_saved', message_id=message_id, **timing_context(message))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--instance-id', required=True)
-    parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail', 'exchange', 'wait'))
+    parser.add_argument('action', choices=('check', 'inbox', 'answer', 'fail', 'exchange', 'wait', 'progress'))
     parser.add_argument('message_id', nargs='?')
     parser.add_argument('stdin_marker', nargs='?', choices=('-',))
     args = parser.parse_args()
@@ -191,6 +236,11 @@ def main():
     config = json.loads((root / 'server.json').read_text())
     if args.instance_id != config['instance_id']:
         parser.error('instance mismatch; refusing to access another route')
+    if args.action == 'progress':
+        if not args.message_id:
+            parser.error('progress requires MESSAGE_ID')
+        print(json.dumps(progress(config, args.message_id), ensure_ascii=False), flush=True)
+        return 0
     if args.action == 'wait':
         if not args.message_id:
             parser.error('wait requires MESSAGE_ID')
@@ -222,7 +272,7 @@ def main():
         result = json.loads(checked.stdout)
         result.update(instance_id=config['instance_id'], user=config['user'], gbb_home=config['gbb_home'])
         result.update(source_commit=config.get('source_commit'), management=config.get('management'),
-                      protocol=1, actions=['inbox', 'answer', 'fail', 'exchange', 'wait'])
+                      protocol=1, actions=['inbox', 'answer', 'fail', 'exchange', 'wait', 'progress'])
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.action == 'inbox' and args.message_id:
