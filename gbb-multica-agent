@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 PRIOR_CONTEXT_LIMIT = 12000
 RUNTIME_CONTEXT_FILE_LIMIT = 1024 * 1024
 GBB_BIN = "/usr/bin/gbb"
@@ -253,6 +253,7 @@ Return ONE JSON object for THIS message via that reply helper (or gbb answer if 
 {"gbb_tool_protocol":1,"request_id":"<request_id below>","tool_calls":[{"id":"c1","name":"multica","arguments":{"args":["project","list"]}}]}
 OR {"gbb_tool_protocol":1,"request_id":"<request_id below>","final":"your answer"}.
 Plain text is also accepted as final. Never claim a write succeeded without a successful tool result.
+This is a NON-INTERACTIVE background task. The user is waiting in Multica, not watching this Grok chat. Do not open ask-user dialogs, choice cards or approval questions here, and do not pause waiting for a chat click. Resolve technical details within the existing authorization yourself: use generated files for required content-file flags and correct rejected syntax when the tool confirms nothing executed. Never blindly repeat an uncertain write. If a necessary user decision or missing task input blocks safe work, immediately return final through the current reply helper, stating what is blocked and the precise question/options for the user in Multica; do not claim completion or keep the routine waiting. If a real permission/connection requirement blocks execution, return fail through the verified helper with the concrete requirement; never bypass native permission controls or treat silence as consent. The user can answer in Multica and start a new task. Report the blocker before ending this run; a Grok-chat-only question does not reach the caller.
 Tools run LOCALLY with the current task's identity and workspace. Never ask for its token.
 Tools:
 - multica_help {"command":[]} lists Bridge-supported operations; {"command":["issue","create"]} returns Bridge-adapted installed CLI help. Get help when flags are uncertain. Native CLI examples in runtime_instructions are not Bridge call syntax: omit the executable, global/output flags and host file paths. Never infer support from native CLI documentation alone.
@@ -1261,7 +1262,7 @@ def main():
                 "bridge_instance": instance, "reply_route": route,
                 "bridge_version": VERSION, "protocol_revision": hashlib.sha256(INSTRUCTIONS.encode()).hexdigest(),
                 **({"prior_context": prior_context} if (index == 0 or (session_id and not message_id)) and prior_context is not None else {}),
-                "read_only": tools.read_only,
+                "read_only": tools.read_only, "interaction_mode": "non_interactive",
                 **({"recovery_attempt": retries} if retries else {}),
                 **({"delivery_mode": "continuous", "session_id": session_id} if session_id else {}),
                 **({"tool_results": history} if session_id and message_id else

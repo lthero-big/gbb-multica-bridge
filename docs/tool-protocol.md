@@ -1,8 +1,10 @@
 # Multica 工具能力与回填协议
 
-包装版本 0.5.6；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
+包装版本 0.5.7；固定 gbb 0.2.0。安装方式见仓库 README。以下 ROUTE、MESSAGE_ID、request_id 均须替换为本轮真实值。回传端通过路由选择本机直连或 SSH；运行端手动验证可使用同用户同 GBB_HOME 的 gbb answer。
 
 ## 使用
+
+Multica 调用是无人值守的后台任务。0.5.7 起每轮 `REQUEST_JSON` 明确带 `interaction_mode=non_interactive`。Bot 不应在 Grok 聊天中弹出提问/选项并等待点击；格式选择、生成正文文件和已确认未执行的参数错误应在现有授权范围内自行处理。确实需要用户决策或缺少输入时，立即通过当前 `answer` 回传 `final`，写明阻塞原因及精确问题/选项，不能把澄清说成任务已完成；该运行结束，用户在 Multica 回答后启动新任务。真正的权限或连接阻塞用当前 `fail` 回传具体要求，不绕过权限，不以沉默代替同意。现有超时仍是兜底；Bridge 看不到 Grok 原生提问卡片，无法强制拦截，指令更新不能证明模型永不偏离。
 
 安装后新开对应实例 Agent 的聊天，发送例如：
 

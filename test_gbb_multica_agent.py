@@ -98,7 +98,7 @@ def check():
                 return [json.loads(line) for line in result.stdout.splitlines()]
 
             version = run("--version")
-            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.6"
+            assert version.returncode == 0 and version.stdout.strip() == "gbb-multica-agent 0.5.7"
             assert not seen, "version must never send a request"
 
             config_before = Path(tmp, "config.json").read_bytes()
@@ -115,6 +115,7 @@ def check():
             assert budget and 3500 <= int(budget.group(1)) <= 3600, "unset GBB_WAIT must provide a one-hour budget"
             request = json.loads(seen[0]["summary"].split("REQUEST_JSON:\n", 1)[1])
             assert request["user_task"] == prompt, "complete task must survive gbb's default truncation limit"
+            assert request['interaction_mode'] == 'non_interactive'
             assert request['runtime_instructions']['content'] == instructions
             assert request['execution_context']['working_directory'] == str(task_dir)
             assert request['execution_context']['project']['local_path'] == '/original/project'

@@ -594,6 +594,7 @@ class ToolTests(unittest.TestCase):
                         messages.append(message)
                         request = json.loads(message['question'].split('REQUEST_JSON:\n', 1)[1])
                         self.assertEqual(request['delivery_mode'], 'continuous')
+                        self.assertEqual(request['interaction_mode'], 'non_interactive')
                         self.assertEqual(message['reply_commands']['answer'][-2:], [message['id'], '-'])
                         if index:
                             self.assertNotIn(prompt, message['question'])

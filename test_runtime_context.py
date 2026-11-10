@@ -138,6 +138,7 @@ class RuntimeContextTests(unittest.TestCase):
         def transport(req, timeout):
             data = json.loads(req['prompt'].split('REQUEST_JSON:\n', 1)[1])
             requests.append(data)
+            self.assertEqual(data['interaction_mode'], 'non_interactive')
             # The initial snapshot must survive both continued calls and a new recovery run.
             (self.root / 'AGENTS.md').write_text('CHANGED_AFTER_START')
             if len(requests) == 1:
