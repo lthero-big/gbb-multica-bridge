@@ -351,13 +351,40 @@ class ToolTests(unittest.TestCase):
             self.assertFalse(self.call(args)['ok'])
         self.assertEqual(len(self.state()['calls']), 1)
 
+    def test_read_only_mode_allows_local_download_but_still_rejects_remote_writes(self):
+        # Choice: read-only forbids Multica state changes; a private local cache copy is an input read.
+        self.tools.read_only = True
+        self.assertTrue(self.call(['attachment', 'download', 'attachment1'])['ok'])
+        denied = self.call(['project', 'create', '--title', 'x'])
+        self.assertFalse(denied['ok'])
+        self.assertNotIn('write_may_have_committed', denied)
+
+    def test_oversize_download_is_terminated_and_cleaned_and_cache_is_bounded(self):
+        cache = self.tools.journal.parent / 'downloads'
+        self.tools.download_limit = 4
+        result = self.call(['attachment', 'download', 'attachment1'])
+        self.assertFalse(result['ok'])
+        self.assertIn('download limit', result['error'])
+        self.assertEqual(list(cache.iterdir()), [])
+        self.tools.download_limit = 1024
+        self.tools.download_cache_limit = 16
+        self.assertTrue(self.call(['attachment', 'download', 'attachment1'])['ok'])
+        full = self.call(['attachment', 'download', 'attachment1'])
+        self.assertFalse(full['ok'])
+        self.assertIn('cache is full', full['error'])
+        # Expired copies of any task are pruned before the next download.
+        old = next(cache.iterdir())
+        os.utime(old, (1, 1))
+        self.assertTrue(self.call(['attachment', 'download', 'attachment1'])['ok'])
+        self.assertFalse(old.exists())
+
     def test_failed_or_unsafe_download_is_cleaned_and_never_claims_success(self):
         self.tools.cli_help(('attachment', 'download'))
         outside = self.root / 'untouched'
         outside.write_text('KEEP')
         outside.chmod(0o644)
         for mode in ('failed', 'empty', 'symlink', 'hardlink', 'directory', 'timeout'):
-            def download(args, *, cwd):
+            def download(args, *, cwd, **_):
                 if mode == 'symlink': (cwd / 'bad').symlink_to(outside)
                 if mode == 'hardlink': os.link(outside, cwd / 'bad')
                 if mode == 'directory': (cwd / 'bad').mkdir()

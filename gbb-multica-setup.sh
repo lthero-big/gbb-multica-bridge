@@ -43,7 +43,14 @@ import uuid
 
 VERSION = "0.5.7"
 PRIOR_CONTEXT_LIMIT = 12000
-RUNTIME_CONTEXT_FILE_LIMIT = 1024 * 1024
+# gbb's transport documents no hard request-size limit (its own webhook view clips at 6000
+# chars), so the first request is bounded here: real instruction files are a few KiB.
+RUNTIME_CONTEXT_FILE_LIMIT = 128 * 1024
+RUNTIME_CONTEXT_TOTAL_LIMIT = 160 * 1024
+DOWNLOAD_FILE_LIMIT = 512 * 1024 * 1024
+DOWNLOAD_CACHE_LIMIT = 2 * 1024 * 1024 * 1024
+DOWNLOAD_RETENTION = 7 * 24 * 3600
+RESOURCE_REF_FIELDS = ("local_path", "execution_mode", "url", "ref", "branch", "name")
 GBB_BIN = "/usr/bin/gbb"
 NODE_BIN = "node"
 
@@ -103,6 +110,9 @@ BLOCKED_FLAGS = {
     "--description-stdin", "--output-dir",
 }
 FILE_FLAGS = {"--content-file", "--description-file", "--instruction-file", "--attachment"}
+TOKEN_PATTERN = re.compile(
+    r"\b(?:(?:mat_|mct_|sk-|gh[pousr]_)[A-Za-z0-9_\-]{12,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|xox[abposr]-[A-Za-z0-9\-]{10,})")
 SECRET_FIELDS = re.compile(
     r"^(custom_env|mcp_config|runtime_config|credentials?|password|authorization|"
     r"token|secret|private_key|client_secret|signing_key|"
@@ -528,6 +538,7 @@ class Tools:
         self.workspace = os.environ.get("MULTICA_WORKSPACE_ID", "")
         self.available = bool(self.workspace and os.environ.get("MULTICA_TOKEN", "").startswith("mat_"))
         self.help_cache, self.results, self.calls, self.writes = {}, {}, {}, {}
+        self.download_limit, self.download_cache_limit = DOWNLOAD_FILE_LIMIT, DOWNLOAD_CACHE_LIMIT
         self.secrets = [v for k, v in os.environ.items() if len(v) >= 8 and
                         re.search(r"TOKEN|SECRET|PASSWORD|API_KEY|WEBHOOK_KEY", k)]
         try:
@@ -571,7 +582,9 @@ class Tools:
         if isinstance(value, str):
             for secret in self.secrets:
                 value = value.replace(secret, "[redacted]")
-            return re.sub(r"\b(?:mat_|mct_|sk-)[A-Za-z0-9_\-]{12,}", "[redacted]", value)
+            value = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=\-]{8,}", r"\1 [redacted]", value)
+            value = re.sub(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s/@:]+(?::[^\s/@]*)?@", r"\1[redacted]@", value)
+            return TOKEN_PATTERN.sub("[redacted]", value)
         return value
 
     def timeout(self):
@@ -808,6 +821,16 @@ class Tools:
             result["next"] = "Read current state before retrying; no automatic write retry."
         return self.redact(result)
 
+    def prune_downloads(self, cache):
+        """Expire old attachment copies of every task; the cache is not a permanent store."""
+        cutoff = time.time() - DOWNLOAD_RETENTION
+        for old in cache.parent.parent.glob('*/downloads/attachment-*'):
+            try:
+                if not old.parent.is_symlink() and not old.is_symlink() and old.lstat().st_mtime < cutoff:
+                    shutil.rmtree(old, ignore_errors=True)
+            except OSError:
+                pass
+
     def download_attachment(self, attachment_id):
         # CLI downloads must live inside their cwd. Keep the private cwd beyond
         # this tool call so the returned artifact path remains usable afterwards.
@@ -816,10 +839,22 @@ class Tools:
             raise ValueError('download cache must not be a symlink')
         cache.mkdir(mode=0o700, exist_ok=True)
         cache.chmod(0o700)
+        self.prune_downloads(cache)
+        budget = min(self.download_limit, self.download_cache_limit - directory_size(cache))
+        if budget <= 0:
+            return {'ok': False, 'error': 'attachment download cache is full; no download started'}
         directory = Path(tempfile.mkdtemp(prefix='attachment-', dir=cache)).resolve()
         keep = False
+
+        def watch(_output=b''):
+            if directory_size(directory) > budget:
+                raise ValueError(f'attachment exceeds the {budget} byte download limit; partial file removed')
         try:
-            code, out, err = self.cli(['attachment', 'download', attachment_id], cwd=directory)
+            try:
+                code, out, err = self.cli(['attachment', 'download', attachment_id], cwd=directory, observe=watch)
+                watch()
+            except ValueError as exc:
+                return {'ok': False, 'error': str(exc)}
             if code:
                 return self.redact({'ok': False, 'exit_code': code, 'data': out.strip(), 'stderr': err.strip()})
             downloaded = []
@@ -1095,7 +1130,19 @@ def session_state(home, session_id, **state):
         Path(name).unlink(missing_ok=True)
 
 
-def runtime_context_file(root, relative):
+def directory_size(path):
+    """Bytes of regular entries without following links; used while a download is running."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def runtime_context_file(root, relative, limit=RUNTIME_CONTEXT_FILE_LIMIT):
     """Read only named context files in the task directory, never follow host pointers."""
     result = {"source": relative}
     try:
@@ -1106,9 +1153,9 @@ def runtime_context_file(root, relative):
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ValueError("context is not a regular file")
-            content = stream.read(RUNTIME_CONTEXT_FILE_LIMIT + 1)
-        if len(content) > RUNTIME_CONTEXT_FILE_LIMIT:
-            raise ValueError("context file exceeds 1 MiB; no partial content forwarded")
+            content = stream.read(limit + 1)
+        if len(content) > limit:
+            raise ValueError(f"context file exceeds {limit // 1024} KiB; no partial content forwarded")
         result.update(status="available", content=content.decode("utf-8"))
     except FileNotFoundError:
         result.update(status="missing")
@@ -1119,13 +1166,18 @@ def runtime_context_file(root, relative):
     return result
 
 
+def local_device_name(default=None):
+    target = os.environ.get("GBB_LOCAL_DEVICE_NAME", default if default is not None else socket.gethostname())
+    if not target.strip() or len(target) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in target):
+        raise ValueError("GBB_LOCAL_DEVICE_NAME must be a non-empty device name without control characters (max 255)")
+    return target
+
+
 def runtime_context():
     """Snapshot startup context once; continuous exchanges carry only new results."""
     root = Path.cwd().resolve()
     device = socket.gethostname()
-    target = os.environ.get("GBB_LOCAL_DEVICE_NAME", device)
-    if not target.strip() or len(target) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in target):
-        raise ValueError("GBB_LOCAL_DEVICE_NAME must be a non-empty device name without control characters (max 255)")
+    target = local_device_name(device)
     context = {"runtime_device_name": device, "runtime_device_name_source": "system_hostname",
                "target_local_device_name": target.strip(),
                "target_device_source": "GBB_LOCAL_DEVICE_NAME" if "GBB_LOCAL_DEVICE_NAME" in os.environ else "system_hostname",
@@ -1136,7 +1188,8 @@ def runtime_context():
         fallback = runtime_context_file(root, ".github/copilot-instructions.md")
         if fallback["status"] != "missing":
             instructions = fallback
-    project = runtime_context_file(root, ".multica/project/resources.json")
+    budget = RUNTIME_CONTEXT_TOTAL_LIMIT - len(instructions.get("content", "").encode())
+    project = runtime_context_file(root, ".multica/project/resources.json", min(RUNTIME_CONTEXT_FILE_LIMIT, max(budget, 0)))
     content = project.pop("content", None)
     if project["status"] == "available":
         try:
@@ -1145,8 +1198,13 @@ def runtime_context():
                     or any(not isinstance(r, dict) or not isinstance(r.get("resource_type"), str)
                            or not isinstance(r.get("resource_ref"), dict) for r in data["resources"])):
                 raise ValueError
-            project.update(id=data.get("project_id"), name=data.get("project_title"), resources=data["resources"])
-            local = [r["resource_ref"] for r in data["resources"] if r["resource_type"] == "local_directory"]
+            # Allowlist: resource_ref may also carry credentials or provider-specific private fields.
+            resources = [{"resource_type": r["resource_type"],
+                          "resource_ref": {k: r["resource_ref"][k] for k in RESOURCE_REF_FIELDS
+                                           if isinstance(r["resource_ref"].get(k), str)}}
+                         for r in data["resources"]]
+            project.update(id=data.get("project_id"), name=data.get("project_title"), resources=resources)
+            local = [r["resource_ref"] for r in resources if r["resource_type"] == "local_directory"]
             if len(local) == 1:
                 project.update({key: local[0][key] for key in ("local_path", "execution_mode") if key in local[0]})
         except (ValueError, TypeError):
@@ -1262,6 +1320,7 @@ def main():
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task):
             raise BridgeError("invalid MULTICA_TASK_ID")
         home = Path(os.environ.get("GBB_HOME") or str(Path.home() / ".grok-bot-bridge"))
+        local_device_name()  # fail before any Bot session is created
         tools = Tools(deadline, home / "multica-runs" / task)
         timing(home, 'task_start', task_id=task)
         if route:

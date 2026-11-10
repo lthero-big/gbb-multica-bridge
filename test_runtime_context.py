@@ -49,7 +49,7 @@ class RuntimeContextTests(unittest.TestCase):
                     'local_path': '/original/Kmoe', 'execution_mode': 'worktree'}}]}))
 
     def test_full_instructions_project_and_distinct_working_directory(self):
-        body = '任务指令\n' * 15000 + 'END_OF_INSTRUCTIONS\n'
+        body = '任务指令\n' * 8000 + 'END_OF_INSTRUCTIONS\n'
         self.write('AGENTS.md', body)
         self.resources()
         with patch.object(AGENT['socket'], 'gethostname', return_value='runtime.local'):
@@ -63,6 +63,30 @@ class RuntimeContextTests(unittest.TestCase):
         self.assertEqual(ctx['project']['execution_mode'], 'worktree')
         self.assertEqual(ctx['project']['name'], 'Kmoe')
         self.assertEqual(result['runtime_instructions']['content'], body)
+
+    def test_provider_tokens_userinfo_and_unlisted_resource_fields_never_reach_the_request(self):
+        pat = 'ghp_' + 'A1b2C3d4' * 5
+        self.write('AGENTS.md', f'use {pat} and Bearer abcdefghijklmnop1234 and AKIAABCDEFGHIJKLMNOP and '
+                                f'https://user:hunter2pass@example.com/r.git')
+        self.resources([{'resource_type': 'github_repo', 'resource_ref': {
+            'url': 'https://oauth:PRIVATEPASS@github.com/o/r.git', 'deploy_key': 'PRIVATE_KEY_FIELD',
+            'branch': 'main', 'nested': {'token': 'x'}}}])
+        tools = AGENT['Tools'](0 + __import__('time').monotonic() + 30, self.root / 'run')
+        text = json.dumps(tools.redact(AGENT['runtime_context']()))
+        tools.close()
+        for leak in (pat, 'abcdefghijklmnop1234', 'AKIAABCDEFGHIJKLMNOP', 'hunter2pass', 'PRIVATEPASS',
+                     'PRIVATE_KEY_FIELD', 'nested'):
+            self.assertNotIn(leak, text)
+        self.assertIn('"branch": "main"', text)
+
+    def test_total_context_is_bounded_and_oversize_is_marked_not_truncated(self):
+        limit, total = AGENT['RUNTIME_CONTEXT_FILE_LIMIT'], AGENT['RUNTIME_CONTEXT_TOTAL_LIMIT']
+        self.write('AGENTS.md', 'a' * limit)
+        self.write('.multica/project/resources.json', json.dumps({'resources': [], 'pad': 'p' * (total - limit)}))
+        project = AGENT['runtime_context']()['execution_context']['project']
+        self.assertEqual(project['status'], 'unavailable')
+        self.assertNotIn('resources', project)
+        self.assertLess(limit, 1024 * 1024)
 
     def test_explicit_device_name_and_multiple_resources_are_not_guessed(self):
         self.resources([{'resource_type': 'local_directory', 'resource_ref': {'local_path': p}}
